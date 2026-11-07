@@ -27,19 +27,25 @@ team. `DEVELOPMENT_TEAM` is intentionally unset until Xcode knows your team.
 
 ## Per checkout
 
-1. Point the project at your team. Open `ios/project.yml`, add
-   `DEVELOPMENT_TEAM: <your team ID>` under `settings: base:`, and run
-   `xcodegen generate`.
+`ios/project.yml` already pins `DEVELOPMENT_TEAM: 53T62XB68X` (the OU field of
+the personal certificate). Change it if you sign with a different Apple ID, then
+run `xcodegen generate`.
 
-   Find the ID in Xcode under Build Settings -> DEVELOPMENT_TEAM, or:
+Find the ID in Xcode under Build Settings -> DEVELOPMENT_TEAM, or:
 
-   ```sh
-   security find-identity -v -p codesigning
-   # Apple Development: you@example.com (ABCDE12345)
-   ```
+```sh
+security find-identity -v -p codesigning
+# Apple Development: you@example.com (ABCDE12345)
 
-2. Open `ios/HEXMobile.xcodeproj`, pick your iPhone, and Run (Cmd-R). Allow
-   Microphone and Speech Recognition, and download a speech model.
+security find-certificate -c "Apple Development" -p \
+  | openssl x509 -noout -subject
+# ... OU=TEAMID ...
+```
+
+2. Open `ios/HEXMobile.xcodeproj`, pick your iPhone, and Run (Cmd-R). On first
+   launch, iOS blocks the app until you trust the certificate: Settings ->
+   General -> VPN & Device Management -> Developer App -> trust your Apple ID.
+   Then allow Microphone and Speech Recognition, and download a speech model.
 
 3. Enable the keyboard: Settings -> General -> Keyboard -> Keyboards -> Add New
    Keyboard -> Hex, then turn on Allow Full Access. The keyboard and app share
@@ -58,3 +64,12 @@ team. `DEVELOPMENT_TEAM` is intentionally unset until Xcode knows your team.
 If Xcode cannot register the App Group, open each target's Signing &
 Capabilities, remove and re-add App Groups, and let Xcode create
 `group.com.wrightbradley.hex.mobile`.
+
+If the certificate exists but `security find-identity -v -p codesigning` reports
+zero valid identities, the Apple WWDR G3 intermediate is missing. Download
+`AppleWWDRCAG3.cer` from <https://www.apple.com/certificateauthority/> and add
+it to the login keychain:
+
+```sh
+security add-certificates -k ~/Library/Keychains/login.keychain-db AppleWWDRCAG3.cer
+```

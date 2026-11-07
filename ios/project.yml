@@ -11,6 +11,7 @@ packages:
     exactVersion: 0.15.5
 settings:
   base:
+    DEVELOPMENT_TEAM: 53T62XB68X
     SWIFT_VERSION: 6.0
 targets:
   HEXMobile:
