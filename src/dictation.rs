@@ -51,6 +51,44 @@ pub fn hotkey_pre_roll(behavior: crate::app_settings::RecordingAudioBehavior) ->
         DoNothing => PRE_ROLL_DURATION,
     }
 }
+/// What started a dictation, and so how its transcript is handled: the
+/// dictation shortcut and a local API client dictate normally, Dictate
+/// without processing skips Output, and Labs › Terminal paste always pastes
+/// with Ctrl+Shift+V. Only the Windows and Linux listeners use it.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DictationFlavour {
+    #[default]
+    Normal,
+    /// Dictate without processing: the transcript is pasted as heard.
+    Raw,
+    /// Labs › Terminal paste shortcut: processed like a normal dictation,
+    /// but pasted with Ctrl+Shift+V whatever Terminal paste says.
+    TerminalPaste,
+    /// Labs › Second dictation shortcut: another key that dictates exactly
+    /// like the dictation shortcut. It is its own owner, so neither
+    /// shortcut finishes or double-taps the other's capture.
+    Second,
+}
+
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+impl DictationFlavour {
+    /// Whether Output's steps are skipped and History says Raw.
+    pub fn raw(self) -> bool {
+        self == Self::Raw
+    }
+
+    /// Whether this paste always sends Ctrl+Shift+V.
+    pub fn terminal_paste(self) -> bool {
+        self == Self::TerminalPaste
+    }
+
+    /// Whether the plain dictation shortcut owns the capture.
+    pub fn normal(self) -> bool {
+        self == Self::Normal
+    }
+}
+
 pub const MINIMUM_HOLD_DURATION: Duration = Duration::from_millis(300);
 /// Audio kept after a shortcut release that finishes a capture, because a
 /// release often lands while the last word is still sounding.
@@ -58,6 +96,14 @@ pub const POST_RELEASE_TAIL: Duration = Duration::from_millis(200);
 /// The longest a release tail grows while speech carries on past
 /// [`POST_RELEASE_TAIL`] (a word still being said as the shortcut goes up).
 pub const MAX_RELEASE_TAIL: Duration = Duration::from_millis(600);
+/// A step in the microphone timeline larger than this is a gap.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) const CHUNK_GAP_TOLERANCE: Duration = Duration::from_millis(50);
+/// On macOS, gaps up to this long (a Bluetooth stream's startup hiccup is
+/// ~140 ms) are filled with silence so the capture keeps going; longer ones
+/// fail it.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) const MAX_PADDED_GAP: Duration = Duration::from_millis(250);
 /// Speech frames in a row (20 ms each) that count as still talking: a key
 /// click is far shorter.
 const TAIL_SPEECH_FRAMES: usize = 5;
@@ -410,7 +456,7 @@ impl DictationClip {
     /// Whether every sample through the release is exactly zero. A real
     /// microphone always carries some noise, so this is a stream still
     /// running but delivering digital silence (#1122), not a quiet room.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub fn is_digital_silence(&self) -> bool {
         let released = self.released();
         !released.is_empty() && released.iter().all(|&sample| sample == 0.0)
@@ -1134,7 +1180,7 @@ impl DictationCapture {
     /// engine logs each stream's count of changes). Every OS's capture loop
     /// calls it after ingesting audio; it does nothing without live text. The
     /// change is also returned, so a host can send it to Live typing's input
-    /// method without showing the plate.
+    /// method or a `/dictations` client without showing the plate.
     pub fn report_live_text(&mut self) -> Option<Partial> {
         let partial = self.take_partial()?;
         let recording = self.recording.as_mut()?;

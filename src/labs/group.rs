@@ -52,6 +52,7 @@ impl Feature {
     pub const fn group(self) -> Group {
         match self {
             Self::LiveText
+            | Self::FailureNotices
             | Self::LiveTyping
             | Self::NotchIndicator
             | Self::VocabularyBiasing
@@ -61,6 +62,9 @@ impl Feature {
             | Self::HideMenuBarIcon
             | Self::QuitClosesWindow
             | Self::SettingsSearch
+            | Self::Appearance
+            | Self::ReleaseNotesLink
+            | Self::SpeakersOnly
             | Self::Playground => Group::Dictation,
             Self::SmartSpacing
             | Self::SpokenFormatting
@@ -68,10 +72,18 @@ impl Feature {
             | Self::FillerWords
             | Self::KeepOnClipboard
             | Self::CopyOnly
+            | Self::ReturnToApp
             | Self::GnomeClipboardRestore
+            | Self::TypedText
             | Self::TerminalPaste
-            | Self::OutputFixes => Group::Output,
-            Self::KeepRecordings | Self::HistoryStats | Self::RecentDictations => Group::History,
+            | Self::OutputFixes
+            | Self::OpenCodeInWsl
+            | Self::ApiProcessing
+            | Self::ApiTimestamps => Group::Output,
+            Self::KeepRecordings
+            | Self::HistoryStats
+            | Self::HistoryMultiSelect
+            | Self::RecentDictations => Group::History,
             Self::Meetings
             | Self::LiveChapters
             | Self::SubtitleExport
@@ -83,24 +95,33 @@ impl Feature {
             | Self::MoreCallApps
             | Self::GnomeMeetingCapsules
             | Self::MeetingImport
+            | Self::MeetingDescriptiveFilenames
+            | Self::MeetingNotesFile
             | Self::ExpireMeetingAudio => Group::Meetings,
-            Self::Screenshots | Self::AnnotateReplay => Group::Annotate,
+            Self::Screenshots | Self::AnnotateReplay | Self::GnomeAnnotate => Group::Annotate,
             Self::MouseShortcuts
             | Self::SecondDictationShortcut
+            | Self::MoreDictationShortcuts
+            | Self::TerminalPasteShortcut
             | Self::SidedChords
             | Self::TapOrHold
+            | Self::DoubleTapModifiers
             | Self::RestoreShortcutDefault
             | Self::StandaloneSpecialKeys
             | Self::SectionKeyAlone
-            | Self::ShareShortcut => Group::Shortcuts,
+            | Self::ShareShortcut
+            | Self::CapsLockDictation
+            | Self::PauseMenu => Group::Shortcuts,
             Self::KeyboardModelSwitching
+            | Self::AppModelSwitching
             | Self::UnloadIdle
             | Self::PickerSortFilter
             | Self::BenchmarkDetails
             | Self::PickerActiveFirst
             | Self::ModelInPlace
             | Self::PickerDownloaded
-            | Self::ParakeetUltra => Group::Models,
+            | Self::ParakeetUltra
+            | Self::TranscribeFiles => Group::Models,
         }
     }
 }

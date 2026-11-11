@@ -79,12 +79,12 @@ let
       hash = "sha256-MJJiug3LfbKsuHcL2+LJk95+j5kk/MWzb5ihdBlHLmE=";
     };
     "rune-0.0.1" = {
-      rev = "a138b97e654b8299b2a4cb518b8476b2b528c2c4";
-      hash = "sha256-AvW2VYBqacOLVShrC9n6ga7NkPWeN7We1GuyKndxBVY=";
+      rev = "ba5e7c8069a24c36f95ca90a3058083cd468fcd1";
+      hash = "sha256-D0zeghVhWooVKQtxObxQDnGdMO0Zgo6uKrCWi7tVHEo=";
     };
     "transcribe-cpp-sys-0.4.1" = {
-      rev = "2778ae4bf5ca5f394d129a39467f4ad9552dc34f";
-      hash = "sha256-BAc2qKUMBZ5D6+Bq12NaZ1+ntWxHv95TYcAMTt3a5X8=";
+      rev = "bcb639faa4c74a2300ba19e30360cb2355b1663a";
+      hash = "sha256-1VztJ0VhPTjAuk4J0NT9KapDOqplegpHOqHsTpfHXWc=";
     };
   };
 in
