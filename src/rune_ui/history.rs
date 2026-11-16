@@ -22,7 +22,11 @@ use crate::history::stats::{AppCount, HistoryStats};
 use crate::history::{History, HistoryEntry, HistoryKind, HistoryRetention, Transcript};
 use crate::transcription::models::TranscriptionModelId;
 
+mod audio;
 mod selection;
+
+pub(super) use self::audio::AudioCopy;
+use self::audio::copy_audio;
 
 /// The stats dialog's width and padding.
 const STATS_WIDTH: f32 = 460.0;
@@ -40,6 +44,9 @@ pub(super) struct HistoryPane {
     revision: Option<u64>,
     pub(super) selected: Option<u64>,
     pub(super) clear_armed: bool,
+    /// The shown entry whose Delete… was pressed, waiting for its
+    /// confirmation.
+    pub(super) delete_armed: Option<u64>,
     pub(super) copied: Option<u64>,
     error: Option<String>,
     /// Labs › Dictation stats: every retained entry summed up, while on.
@@ -62,6 +69,9 @@ pub(super) struct HistoryPane {
     /// Labs › Keep recordings: the entry playing through the output, if one
     /// started from the card.
     pub(super) playback: Option<Playback>,
+    /// Labs › Copy dictation audio: the entry whose kept audio is going to
+    /// the clipboard or last went there.
+    pub(super) audio: Option<AudioCopy>,
 }
 
 /// Transcribe again's chosen model and the language for this one run.
@@ -112,13 +122,19 @@ impl HistoryPane {
     }
 
     /// Refreshes the bounded snapshot for the current query, and the stats.
+    /// A reload, as entering the pane does, stops any Delete… confirmation.
     pub(super) fn reload(&mut self) {
+        self.delete_armed = None;
         self.reload_entries();
         self.reload_stats();
     }
 
     fn reload_entries(&mut self) {
+        let requery = self.searched != self.search.text;
         self.searched = self.search.text.clone();
+        if requery {
+            self.delete_armed = None;
+        }
         let Some(store) = &self.store else {
             return;
         };
@@ -133,6 +149,23 @@ impl HistoryPane {
         }
         // A search, a delete, or new dictations leave no selected id behind.
         selection::prune(self);
+        if self
+            .delete_armed
+            .is_some_and(|id| self.selected != Some(id))
+        {
+            self.delete_armed = None;
+        }
+    }
+
+    /// Escape: Delete… stops asking. Returns whether it was asking.
+    pub(super) fn cancel_delete(&mut self) -> bool {
+        self.delete_armed.take().is_some()
+    }
+
+    /// Delete… asks for `id`, and stops any other confirmation.
+    pub(super) fn arm_delete(&mut self, id: u64) {
+        self.clear_armed = false;
+        self.delete_armed = Some(id);
     }
 
     /// Sums up every retained entry, only while Labs › Dictation stats is
@@ -160,6 +193,7 @@ impl HistoryPane {
         // Playback's answer returns the card to Play; it is not a reason to
         // read the stats again.
         let played = self.poll_playback();
+        let copied = self.poll_audio();
         let mut changed = false;
         // Labs › Select multiple dictations off, History keeps one selected
         // entry: the others fall away.
@@ -192,7 +226,7 @@ impl HistoryPane {
             changed = true;
         }
         let Some(store) = self.store.as_ref().filter(|_| visible) else {
-            return answered || played || changed;
+            return answered || played || copied || changed;
         };
         let stale = self.search.text != self.searched || self.revision != Some(store.revision());
         if stale {
@@ -204,7 +238,7 @@ impl HistoryPane {
             self.reload_stats();
             return true;
         }
-        answered || played || changed
+        answered || played || copied || changed
     }
 
     /// Takes Transcribe again's answer once its worker sends it.
@@ -348,15 +382,11 @@ fn set_retention(ui: &mut Ui, retention: HistoryRetention) {
     if !ui.update(|settings| settings.history_retention = retention) {
         return;
     }
-    if let Some(store) = &ui.history.store
-        && let Err(error) = store.set_retention(retention)
-    {
-        ui.history.error = Some(error.to_string());
-    }
     ui.history.reload();
 }
 
 fn clear(ui: &mut Ui) {
+    ui.history.delete_armed = None;
     if !ui.history.clear_armed {
         ui.history.clear_armed = true;
         return;
@@ -557,6 +587,7 @@ fn restore(ui: &mut Ui, id: u64, index: usize) {
 }
 
 fn delete(ui: &mut Ui, id: u64) {
+    ui.history.delete_armed = None;
     if let Some(store) = &ui.history.store {
         if let Err(error) = store.delete(id) {
             ui.history.error = Some(error.to_string());
@@ -890,9 +921,16 @@ fn copy_action(ui: &Ui, p: Paint, id: u64, in_row: bool) -> El {
         ld::COPY_ICON
     };
     let press = move |ui: &mut Ui, tx: &mut Tx| {
+        // A pending Copy audio still lands on the clipboard when it
+        // finishes, so it wins over a text Copy until then.
+        if ui.history.audio_copy_pending() {
+            return;
+        }
         if let Some(entry) = ui.history.entry(id) {
             tx.copy(entry.final_text.clone());
             ui.history.copied = Some(id);
+            // One "Copied" at a time: this replaces Copy audio's check.
+            ui.history.audio = None;
             ui.history.error = None;
         }
     };
@@ -1019,6 +1057,38 @@ fn detail(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
     if ui.settings.labs.keep_recordings && !entry.versions.is_empty() {
         body = body.child(versions_section(ui, p, entry));
     }
+    let armed = pane.delete_armed == Some(id);
+    let mut actions = Vec::new();
+    let confirm = armed.then(|| {
+        row()
+            .key("delete-confirm")
+            .gap(8.0)
+            .pt(14.0)
+            .child(button(
+                p,
+                "history-confirm-delete",
+                tr("Confirm delete"),
+                ButtonKind::Danger,
+                move |ui: &mut Ui, _| delete(ui, id),
+            ))
+            .child(button(
+                p,
+                "history-cancel-delete",
+                tr("Cancel"),
+                ButtonKind::Secondary,
+                |ui: &mut Ui, _| ui.history.delete_armed = None,
+            ))
+    });
+    if !armed {
+        actions.push(copy_action(ui, p, id, false));
+        actions.push(ld::ghost_icon(
+            p,
+            "history-delete",
+            ld::TRASH_ICON,
+            tr("Delete…"),
+            move |ui: &mut Ui, _| ui.history.arm_delete(id),
+        ));
+    }
     col()
         .key("history-detail")
         .grow(1.0)
@@ -1026,17 +1096,9 @@ fn detail(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> El {
         .child(ld::card_header(
             ld::card_title(p, tr(entry.kind.label())),
             vec![ld::meta_text(p, &event_age(entry.timestamp_ms))],
-            vec![
-                copy_action(ui, p, id, false),
-                ld::ghost_icon(
-                    p,
-                    "history-delete",
-                    ld::TRASH_ICON,
-                    tr("Delete"),
-                    move |ui: &mut Ui, _| delete(ui, id),
-                ),
-            ],
+            actions,
         ))
+        .children(confirm)
         .child(ld::card_scroll(p, "detail-scroll", body))
 }
 
@@ -1081,6 +1143,25 @@ fn again_section(ui: &Ui, p: Paint, id: u64, layer: &mut Vec<El>) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(section_label(p, "label", tr("Saved recording")).grow(1.0))
+                // Labs › Copy dictation audio: the kept WAV as a file on the
+                // clipboard, ready to attach.
+                .children(ui.settings.labs.copy_dictation_audio.then(|| {
+                    let audio = ui.history.audio.as_ref().filter(|audio| audio.id == id);
+                    let copying = audio.is_some_and(|audio| audio.worker.is_some());
+                    let copied = audio.is_some_and(|audio| matches!(audio.result, Some(Ok(()))));
+                    small_button(
+                        p,
+                        "again-copy-audio",
+                        if copying {
+                            tr("Copying…")
+                        } else if copied {
+                            tr("Copied")
+                        } else {
+                            tr("Copy audio")
+                        },
+                        move |ui: &mut Ui, _| copy_audio(ui, id),
+                    )
+                }))
                 .child(small_button(
                     p,
                     "again-play",
@@ -1098,6 +1179,22 @@ fn again_section(ui: &Ui, p: Paint, id: u64, layer: &mut Vec<El>) -> El {
                 )),
         )
         .child(menu);
+    if let Some(error) = ui
+        .history
+        .audio
+        .as_ref()
+        .filter(|audio| audio.id == id)
+        .and_then(|audio| audio.result.as_ref())
+        .and_then(|result| result.as_ref().err())
+    {
+        section = section.child(
+            text(tr_fill("Could not copy the audio: {}", error))
+                .key("again-copy-audio-error")
+                .font(super::controls::DESCRIPTION)
+                .color(p.muted())
+                .wrap(),
+        );
+    }
     if let Some(error) = ui
         .history
         .playback

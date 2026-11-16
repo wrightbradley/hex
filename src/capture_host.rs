@@ -93,7 +93,7 @@ pub use permissions::{
 };
 pub use replay::available as replay_available;
 pub use routing::CaptureRoute;
-pub use routing::{RouteAnswer, RouteDelivery, RouteDest};
+pub use routing::{RouteAnswer, RouteDelivery, RouteDest, SEND_HOLD};
 #[cfg(target_os = "macos")]
 pub use routing::{recent_sessions, send_image};
 #[cfg(target_os = "macos")]
@@ -476,13 +476,10 @@ impl Host for HexHost {
 /// looks through for clicks: the ink overlay, and the capsule's panel, which
 /// lets clicks through everywhere but its pill. Clicks on the pill never
 /// reach the engine ([`CapsulePill`]).
-fn own_windows_of(own: &[Option<u32>; 3]) -> OwnWindows {
+fn own_windows_of(own: &OwnWindowIds) -> OwnWindows {
     OwnWindows {
-        excluded: own.iter().flatten().copied().collect(),
-        passthrough: [OwnWindow::Ink, OwnWindow::Capsule]
-            .into_iter()
-            .filter_map(|role| own[role as usize])
-            .collect(),
+        excluded: own.excluded(),
+        passthrough: [own.ink, own.capsule].into_iter().flatten().collect(),
         recorded: Arc::clone(&OWN_WINDOWS_RECORDED),
     }
 }
@@ -551,7 +548,8 @@ impl CapsulePill {
         };
         let Some(window) = OWN_WINDOWS
             .lock()
-            .unwrap_or_else(|error| error.into_inner())[OwnWindow::Capsule as usize]
+            .unwrap_or_else(|error| error.into_inner())
+            .capsule
         else {
             return false;
         };
@@ -587,7 +585,31 @@ fn on_pill(origin: [f64; 2], pill: [f32; 4], x: f64, y: f64) -> bool {
 
 /// Hex's windows a capture leaves out of its recording, one per role. A
 /// capture reads them when it starts.
-static OWN_WINDOWS: Mutex<[Option<u32>; 3]> = Mutex::new([None, None, None]);
+static OWN_WINDOWS: Mutex<OwnWindowIds> = Mutex::new(OwnWindowIds {
+    capsule: None,
+    ink: None,
+    picker: None,
+});
+
+/// The window holding each [`OwnWindow`] role.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnWindowIds {
+    capsule: Option<u32>,
+    ink: Option<u32>,
+    picker: Option<u32>,
+}
+
+impl OwnWindowIds {
+    /// Every window held, which a recording leaves out.
+    fn excluded(self) -> Vec<u32> {
+        let Self {
+            capsule,
+            ink,
+            picker,
+        } = self;
+        [capsule, ink, picker].into_iter().flatten().collect()
+    }
+}
 
 /// Which of Hex's windows a capture leaves out.
 #[derive(Clone, Copy, Debug)]
@@ -608,7 +630,11 @@ pub fn exclude_window(role: OwnWindow, window: u32) {
     let mut own = OWN_WINDOWS
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    own[role as usize] = Some(window);
+    *match role {
+        OwnWindow::Capsule => &mut own.capsule,
+        OwnWindow::Ink => &mut own.ink,
+        OwnWindow::Picker => &mut own.picker,
+    } = Some(window);
     let joined = own_windows_of(&own);
     drop(own);
     let Some(source) = ink_source() else { return };
@@ -1109,6 +1135,9 @@ pub struct SettledCapture {
     pub missing_transcript: Option<String>,
     /// Why a capture failed, when Hex knows.
     pub error: Option<String>,
+    /// Why a written capture's summary didn't reach the clipboard; `None`
+    /// once it did (or for a capture that isn't copied).
+    pub copy_error: Option<String>,
     /// Where a written capture goes, while captures are sent to OpenCode
     /// (`capture.routing`'s `autoSend`).
     pub route: Option<CaptureRoute>,
@@ -1350,11 +1379,11 @@ impl Outcomes {
     }
 
     fn settle(&mut self, bundle: PathBuf, stage: Stage, written: Option<Written>) {
-        self.settle_with(bundle, stage, written, None, None);
+        self.settle_with(bundle, stage, written, None, None, None);
     }
 
     fn fail(&mut self, bundle: PathBuf, error: String) {
-        self.settle_with(bundle, Stage::Failed, None, Some(error), None);
+        self.settle_with(bundle, Stage::Failed, None, Some(error), None, None);
     }
 
     /// A switch discarded `bundle` and then could not start: its outcome,
@@ -1367,6 +1396,7 @@ impl Outcomes {
             gaps: None,
             missing_transcript: None,
             error: Some(error),
+            copy_error: None,
             route: None,
         });
         self.publish();
@@ -1396,6 +1426,7 @@ impl Outcomes {
         stage: Stage,
         written: Option<Written>,
         error: Option<String>,
+        copy_error: Option<String>,
         route: Option<CaptureRoute>,
     ) {
         let discarded = self
@@ -1411,6 +1442,7 @@ impl Outcomes {
                 gaps: written.as_ref().map(|written| written.gaps),
                 missing_transcript: written.and_then(|written| written.missing_transcript),
                 error,
+                copy_error,
                 route,
             });
         }
@@ -3342,9 +3374,22 @@ fn finish_captures(
                     missing_transcript = written.missing_transcript.as_deref(),
                     "capture finished"
                 );
-                copy_to_clipboard(&bundle);
+                let copy_error = if crate::capture_zip::copy_as_zip(&bundle) {
+                    None
+                } else {
+                    copy_to_clipboard(&bundle)
+                        .err()
+                        .map(|error| format!("{error:#}"))
+                };
                 let route = look.as_ref().map(|_| CaptureRoute::looking());
-                lock(outcomes).settle_with(bundle.clone(), Stage::Done, Some(written), None, route);
+                lock(outcomes).settle_with(
+                    bundle.clone(),
+                    Stage::Done,
+                    Some(written),
+                    None,
+                    copy_error,
+                    route,
+                );
                 if let Some(look) = look {
                     let job = routing::Job::Written {
                         bundle: bundle.clone(),
@@ -3452,32 +3497,18 @@ fn summary(bundle: &Path) -> anyhow::Result<String> {
 /// The process's one paster for captures. On X11 it serves the clipboard
 /// for as long as it lives, so a copied capture stays pasteable.
 #[cfg(target_os = "linux")]
-fn with_linux_paster(
+pub(crate) fn with_linux_paster(
     use_it: impl FnOnce(&mut crate::linux::paste::LinuxPaster) -> Result<()>,
 ) -> anyhow::Result<()> {
-    static PASTER: Mutex<Option<crate::linux::paste::LinuxPaster>> = Mutex::new(None);
-    let mut paster = PASTER.lock().unwrap_or_else(|error| error.into_inner());
-    if paster.is_none() {
-        let shift = crate::app_settings::AppSettings::load()
-            .map(|settings| settings.paste_with_shift)
-            .unwrap_or(false);
-        *paster = Some(
-            crate::linux::paste::LinuxPaster::new(
-                Arc::default(),
-                Arc::new(AtomicBool::new(shift)),
-                Default::default(),
-            )
-            .map_err(|error| anyhow::anyhow!("{error:#}"))?,
-        );
-    }
-    use_it(paster.as_mut().expect("made above")).map_err(|error| anyhow::anyhow!("{error:#}"))
+    crate::linux::paste::with_paster(use_it).map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// Copies a written capture to the clipboard, as Scrawl does: its summary,
-/// ready to paste into an agent.
-fn copy_to_clipboard(bundle: &Path) {
+/// ready to paste into an agent. The capsule says "Summary copied" only
+/// once this is `Ok`.
+fn copy_to_clipboard(bundle: &Path) -> anyhow::Result<()> {
     if cfg!(test) {
-        return;
+        return Ok(());
     }
     #[cfg(target_os = "macos")]
     let copied =
@@ -3487,9 +3518,10 @@ fn copy_to_clipboard(bundle: &Path) {
         summary(bundle).and_then(|summary| with_linux_paster(|paster| paster.copy(&summary)));
     #[cfg(target_os = "windows")]
     let copied = scrawl_capture::handoff::copy_bundle_to_clipboard(bundle);
-    if let Err(error) = copied {
+    if let Err(error) = &copied {
         tracing::warn!(error = format!("{error:#}"), "could not copy the capture");
     }
+    copied.map_err(|error| anyhow::anyhow!("{error:#}"))
 }
 
 /// One capture's audio thread: starts the engine, collects until the sink
@@ -3776,7 +3808,11 @@ mod tests {
             window(capsule, own, [544.0, 0.0, 640.0, 424.0], 27),
             window(app, own + 1, [0.0, 0.0, 1728.0, 1117.0], 0),
         ];
-        let roles = [Some(capsule), Some(ink), None];
+        let roles = OwnWindowIds {
+            capsule: Some(capsule),
+            ink: Some(ink),
+            picker: None,
+        };
         let OwnWindows {
             excluded,
             passthrough,

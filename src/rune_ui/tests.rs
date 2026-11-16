@@ -339,20 +339,12 @@ fn gnome_desktops_point_to_the_clipboard_lab_until_it_is_on() {
 }
 
 #[test]
-fn restore_default_brings_back_paste_last_only_with_its_lab_on() {
+fn reset_brings_back_paste_lasts_default() {
     use crate::app_settings::HotkeyBinding;
     let default = HotkeyBinding::paste_last_default();
     let mut rt = runtime("portal", true, TALL_SIZE);
     open_advanced(&mut rt, Pane::General);
     rt.state.settings.paste_last_hotkey = None;
-    rt.invalidate();
-    settle(&mut rt);
-    assert!(
-        rt.find("restore-paste-last").is_none(),
-        "hidden while Labs › Restore shortcut default is off"
-    );
-
-    rt.state.settings.labs.restore_shortcut_default = true;
     rt.invalidate();
     settle(&mut rt);
     let note = format!("Default shortcut: {}", default.keycaps().join("+"));
@@ -380,6 +372,36 @@ fn restore_default_brings_back_paste_last_only_with_its_lab_on() {
         rt.state.capture,
         settings::Capture::Listening {
             message: Some(_),
+            ..
+        }
+    ));
+}
+
+/// The Paste last recorder says Backspace turns it off, and plain
+/// Backspace does; Dictation's recorder says nothing and keeps its binding.
+#[test]
+fn backspace_in_an_optional_recorder_turns_the_shortcut_off() {
+    let hint = "Press Backspace to turn it off";
+    let mut rt = runtime("portal", true, TALL_SIZE);
+    open_advanced(&mut rt, Pane::General);
+    assert!(rt.state.settings.paste_last_hotkey.is_some());
+    assert!(!texts(&rt).iter().any(|text| text == hint));
+    tap(&mut rt, "paste-last-hotkey");
+    assert!(texts(&rt).iter().any(|text| text == hint));
+    key(&mut rt, Key::Backspace, Mods::default());
+    assert_eq!(rt.state.settings.paste_last_hotkey, None);
+    assert!(!matches!(rt.state.capture, Capture::Listening { .. }));
+    assert!(!texts(&rt).iter().any(|text| text == hint));
+
+    let dictation = rt.state.settings.dictation_hotkey.clone();
+    tap(&mut rt, "dictation-hotkey");
+    assert!(!texts(&rt).iter().any(|text| text == hint));
+    key(&mut rt, Key::Backspace, Mods::default());
+    assert_eq!(rt.state.settings.dictation_hotkey, dictation);
+    assert!(matches!(
+        rt.state.capture,
+        Capture::Listening {
+            message: Some("Add a modifier"),
             ..
         }
     ));
@@ -430,6 +452,27 @@ fn settings_search_shows_with_its_lab_and_filters_general() {
     assert!(rt.find("settings-empty").is_none());
     assert!(rt.find("microphone").is_some());
     assert!(rt.find("basics").is_some());
+}
+
+#[test]
+fn the_settings_search_clear_button_empties_the_field_and_restores_the_pane() {
+    let mut rt = runtime("portal", true, TALL_SIZE);
+    rt.state.settings.labs.settings_search = true;
+    rt.invalidate();
+    settle(&mut rt);
+    rt.update(|ui, _| ui.general_search = rune::TextEdit::new("microphone"));
+    settle(&mut rt);
+    assert!(rt.find("microphone").is_some());
+    assert!(rt.find("transcription").is_none());
+    tap(&mut rt, "settings-search/action");
+    assert!(
+        rt.state.general_search.text.is_empty(),
+        "the clear button empties the field"
+    );
+    assert!(
+        rt.find("transcription").is_some(),
+        "and the rest of the pane comes back"
+    );
 }
 
 #[test]
@@ -1282,7 +1325,25 @@ fn history_selects_deletes_and_clears_in_two_steps() {
     let mut rt = runtime("history", true, PANE_SIZE);
     tap(&mut rt, "history-entry3");
     assert_eq!(rt.state.history.selected, Some(3));
+    // Delete… only asks. Cancel keeps the entry.
     tap(&mut rt, "history-delete");
+    assert_eq!(rt.state.history.delete_armed, Some(3));
+    assert!(rt.find("history-confirm-delete").is_some());
+    assert!(rt.find("history-delete").is_none());
+    tap(&mut rt, "history-cancel-delete");
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(rt.state.history.entries.iter().any(|entry| entry.id == 3));
+    // Escape answers the confirmation too.
+    tap(&mut rt, "history-delete");
+    key(&mut rt, Key::Escape, Mods::default());
+    settle(&mut rt);
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(rt.find("history-confirm-delete").is_none());
+    assert!(rt.state.history.entries.iter().any(|entry| entry.id == 3));
+    // Only the confirmation deletes.
+    tap(&mut rt, "history-delete");
+    tap(&mut rt, "history-confirm-delete");
+    assert!(rt.state.history.delete_armed.is_none());
     assert!(rt.state.history.entries.iter().all(|entry| entry.id != 3));
     // Clear all history… sits at the bottom of the retention menu and only
     // asks; Cancel keeps everything, and only the confirmation clears.
@@ -1299,6 +1360,79 @@ fn history_selects_deletes_and_clears_in_two_steps() {
     tap(&mut rt, &clear);
     tap(&mut rt, "history-confirm-clear");
     assert!(rt.state.history.entries.is_empty());
+}
+
+#[test]
+fn history_delete_confirmation_stops_when_the_pane_moves_on() {
+    use crate::history::{History, HistoryDraft, HistoryKind, HistoryRetention, HistoryStore};
+    let directory =
+        std::env::temp_dir().join(format!("hex-rune-history-disarm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let history = History::new(HistoryStore::open(
+        directory.join("history.json"),
+        HistoryRetention::Week,
+        crate::history::now_ms(),
+    ));
+    let record = |text: &str| {
+        history
+            .record(HistoryDraft {
+                kind: HistoryKind::Dictation,
+                raw_text: text.into(),
+                final_text: text.into(),
+                application: None,
+                processing: None,
+                audio_ms: 900,
+                inference_ms: 80,
+                total_ms: 200,
+                recording: None,
+                model: None,
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let first = record("Ship it.");
+    let second = record("Ship it again.");
+    let mut rt = runtime("history-empty", true, PANE_SIZE);
+    rt.state.history = history::HistoryPane::shared(Some(history));
+    rt.state.history.selected = Some(first);
+    rt.state.history.reload();
+    rt.invalidate();
+    settle(&mut rt);
+    // Choosing another entry answers Delete… and leaves the first entry be.
+    tap(&mut rt, "history-delete");
+    tap(&mut rt, &format!("history-entry{second}"));
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(
+        rt.state
+            .history
+            .entries
+            .iter()
+            .any(|entry| entry.id == first)
+    );
+    // Clear all history… answers it, then asks for its own confirmation.
+    tap(&mut rt, &format!("history-entry{first}"));
+    tap(&mut rt, "history-delete");
+    tap(&mut rt, "history-retention-field-trigger");
+    let clear = menu_item(&rt, "history-retention", "Clear all history…");
+    tap(&mut rt, &clear);
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(rt.find("history-confirm-delete").is_none());
+    tap(&mut rt, "history-cancel-clear");
+    // Leaving History answers it too.
+    tap(&mut rt, "history-delete");
+    tap(&mut rt, "nav-output");
+    tap(&mut rt, "nav-history");
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(rt.find("history-confirm-delete").is_none());
+    // A search answers it.
+    tap(&mut rt, "history-delete");
+    tap(&mut rt, "history-search");
+    rt.paste("zebra");
+    settle(&mut rt);
+    assert!(rt.state.history.delete_armed.is_none());
+    assert!(rt.find("history-confirm-delete").is_none());
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
@@ -2042,6 +2176,91 @@ fn transcribe_again_shows_only_with_its_lab_and_replace_updates_the_entry() {
 }
 
 #[test]
+fn copy_audio_shows_only_with_its_lab_and_keep_recordings() {
+    use crate::history::{
+        History, HistoryDraft, HistoryKind, HistoryRetention, HistoryStore, Recording,
+    };
+    let directory =
+        std::env::temp_dir().join(format!("hex-rune-copy-audio-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let history = History::new(HistoryStore::open(
+        directory.join("history.json"),
+        HistoryRetention::Week,
+        crate::history::now_ms(),
+    ));
+    let id = history
+        .record(HistoryDraft {
+            kind: HistoryKind::Dictation,
+            raw_text: "ship it".into(),
+            final_text: "Ship it.".into(),
+            application: None,
+            processing: None,
+            audio_ms: 900,
+            inference_ms: 80,
+            total_ms: 200,
+            recording: Some(Recording::from_samples(vec![0.2; 1_600])),
+            model: Some("Parakeet v3".into()),
+        })
+        .unwrap()
+        .unwrap();
+    let mut rt = runtime("history-empty", true, GOLDEN_SIZE);
+    rt.state.history = history::HistoryPane::shared(Some(history.clone()));
+    rt.state.history.reload();
+    rt.state.history.selected = Some(id);
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(
+        rt.find("again-copy-audio").is_none(),
+        "off, History is unchanged"
+    );
+
+    rt.state.settings.labs.keep_recordings = true;
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(
+        rt.find("again-copy-audio").is_none(),
+        "Keep recordings alone does not add Copy audio"
+    );
+
+    rt.state.settings.labs.copy_dictation_audio = true;
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(
+        rt.find("again-copy-audio").is_some(),
+        "both switches on, the kept audio can be copied"
+    );
+
+    // A text Copy waits for a running Copy audio, which still lands the WAV
+    // on the clipboard; the pending state is kept.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    rt.state.history.audio = Some(history::AudioCopy::pending(id, receiver));
+    rt.invalidate();
+    settle(&mut rt);
+    tap(&mut rt, "history-copy");
+    assert_eq!(
+        rt.copy_request.as_deref(),
+        None,
+        "a pending Copy audio wins over a text Copy"
+    );
+    assert!(
+        rt.state.history.audio.is_some(),
+        "the pending Copy audio is kept"
+    );
+    drop(sender);
+    rt.state.history.audio = None;
+
+    rt.state.settings.labs.keep_recordings = false;
+    rt.invalidate();
+    settle(&mut rt);
+    assert!(
+        rt.find("again-copy-audio").is_none(),
+        "turning Keep recordings off hides it again"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
 fn leaving_an_entry_or_turning_off_keep_recordings_stops_playback() {
     use crate::history::playback::Playback;
     let mut rt = runtime("history", true, GOLDEN_SIZE);
@@ -2141,7 +2360,7 @@ fn modes_add_select_and_delete() {
         "Mode 3"
     );
     tap(&mut rt, "delete-mode");
-    assert!(rt.state.modes.delete_armed);
+    assert!(rt.state.modes.delete_armed.is_some());
     tap(&mut rt, "confirm-delete-mode");
     assert_eq!(rt.state.settings.dictation_processing.modes.len(), 2);
     assert_eq!(rt.state.modes.selected, modes::Selection::Default);
@@ -2627,6 +2846,8 @@ fn the_vocabulary_row_says_when_the_model_ignores_the_list() {
 fn the_sound_sets_sheet_plays_and_chooses_sets() {
     use crate::feedback::{Audition, Cue, SoundSet};
     let mut rt = runtime("portal", true, GOLDEN_SIZE);
+    rt.state.settings.sound_effects = false;
+    rt.state.settings.sound_effect_volume = 0.23;
     assert_eq!(rt.state.settings.sound_theme, SoundSet::Classic);
     open_advanced(&mut rt, Pane::General);
     tap(&mut rt, "sound-set-control");
@@ -2664,6 +2885,8 @@ fn the_sound_sets_sheet_plays_and_chooses_sets() {
     assert!(!rt.state.sound_sets.open);
     assert_eq!(playing(&rt), None);
     assert!(texts(&rt).iter().any(|text| text == "Wood"));
+    assert!(!rt.state.settings.sound_effects);
+    assert_eq!(rt.state.settings.sound_effect_volume, 0.23);
 }
 
 #[test]
@@ -2735,7 +2958,13 @@ fn the_sidebar_moves_with_arrows_and_command_numbers() {
         focused(&rt)
     );
     key(&mut rt, Key::Down, Mods::default());
-    assert!(rt.state.labs_open, "a second Down keeps Labs open");
+    assert_eq!(rt.state.pane, Pane::WhatsNew);
+    assert!(!rt.state.labs_open);
+    assert!(focused(&rt).ends_with("nav-whats-new"));
+    key(&mut rt, Key::Down, Mods::default());
+    assert_eq!(rt.state.pane, Pane::WhatsNew, "Down stops before Quit");
+    key(&mut rt, Key::Up, Mods::default());
+    assert!(rt.state.labs_open, "Up from What's new returns to Labs");
     key(&mut rt, Key::Up, Mods::default());
     assert_eq!(rt.state.pane, last, "Up returns to the last pane");
     assert!(!rt.state.labs_open);
@@ -3072,8 +3301,11 @@ fn gpu() -> Option<std::sync::MutexGuard<'static, Gpu>> {
 }
 
 fn render(scene: &str, dark: bool, size: (f32, f32)) -> Option<(u32, u32, Vec<u8>)> {
+    render_runtime(runtime(scene, dark, size), size)
+}
+
+fn render_runtime(mut rt: Runtime<Ui>, size: (f32, f32)) -> Option<(u32, u32, Vec<u8>)> {
     let gpu = gpu()?;
-    let mut rt = runtime(scene, dark, size);
     let mut renderer = crate::rune_ui::offscreen::renderer(&gpu.device);
     let (width, height) = (
         (size.0 * GOLDEN_SCALE) as u32,
@@ -3127,8 +3359,12 @@ fn read_png(path: &std::path::Path) -> (u32, u32, Vec<u8>) {
 }
 
 fn check_golden(scene: &str, dark: bool, size: (f32, f32)) {
+    check_render(scene, dark, render(scene, dark, size));
+}
+
+fn check_render(scene: &str, dark: bool, pixels: Option<(u32, u32, Vec<u8>)>) {
     let name = format!("{scene}-{}", if dark { "dark" } else { "light" });
-    let Some((width, height, pixels)) = render(scene, dark, size) else {
+    let Some((width, height, pixels)) = pixels else {
         assert!(
             std::env::var_os("HEX_REQUIRE_GPU").is_none(),
             "golden {name}: no GPU adapter, and HEX_REQUIRE_GPU is set"
@@ -3205,6 +3441,33 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[test]
+fn whats_new_opens_controls_without_changing_them() {
+    let _goldens = Goldens::collect();
+    for dark in [true, false] {
+        for (key, scene) in [
+            (None, "whats-new"),
+            (Some("open-lab"), "whats-new-yolo"),
+            (Some("open-sounds"), "whats-new-sounds"),
+        ] {
+            let mut rt = runtime("mac-settings", dark, PANE_SIZE);
+            let before = serde_json::to_value(&rt.state.settings).unwrap();
+            tap(&mut rt, "nav-whats-new");
+            assert_eq!(rt.state.pane, Pane::WhatsNew);
+            if let Some(key) = key {
+                tap(&mut rt, key);
+                if key == "open-lab" {
+                    assert!(rt.state.labs_open && rt.find("lab-card-yolo-mode").is_some());
+                } else {
+                    assert!(rt.find("sound-sets").is_some());
+                }
+            }
+            assert_eq!(serde_json::to_value(&rt.state.settings).unwrap(), before);
+            check_render(scene, dark, render_runtime(rt, PANE_SIZE));
+        }
+    }
+}
+
 /// Collects every golden mismatch in a test and fails once at the end, so
 /// one CI run uploads every render that moved rather than only the first.
 struct Goldens;
@@ -3261,6 +3524,7 @@ fn goldens() {
     check_golden("history-menu", true, PANE_SIZE);
 }
 
+mod application_picker;
 mod onboarding_check;
 mod panes;
 
@@ -3338,7 +3602,7 @@ fn typed_text_shows_its_recorder_only_with_its_lab() {
     );
 }
 
-/// Labs › Fix results in Output: the Try card offers Vocabulary and Fix
+/// Labs › Fix results in Output: the Try row offers Vocabulary and Fix
 /// this only with the toggle on, and Fix this copies for the sentence typed.
 #[test]
 fn output_fixes_show_only_with_their_lab_and_fix_this_copies_for_the_sentence() {

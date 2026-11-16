@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(hex_capture)]
+pub mod annotations;
 pub mod captures;
 pub mod playback;
 pub mod recordings;
@@ -48,6 +50,10 @@ pub enum HistoryRetention {
 }
 
 impl HistoryRetention {
+    /// Entries exactly at the cutoff remain visible. Off preserves old entries.
+    pub fn cutoff(self, now_ms: u64) -> Option<u64> {
+        self.max_age_ms().map(|age| now_ms.saturating_sub(age))
+    }
     pub const ALL: [Self; 5] = [Self::Off, Self::Day, Self::Week, Self::Month, Self::Forever];
 
     pub const fn label(self) -> &'static str {
@@ -376,11 +382,11 @@ impl HistoryStore {
     /// entry past retention is pruned in memory first, so the revision also
     /// moves when time expires one; the idle worker saves that prune.
     pub fn revision(&mut self, now_ms: u64) -> u64 {
-        if let Some(max_age) = self.retention.max_age_ms()
+        if let Some(cutoff) = self.retention.cutoff(now_ms)
             && self
                 .entries
                 .first()
-                .is_some_and(|entry| entry.timestamp_ms < now_ms.saturating_sub(max_age))
+                .is_some_and(|entry| entry.timestamp_ms < cutoff)
         {
             self.prune(now_ms);
         }
@@ -522,6 +528,25 @@ impl HistoryStore {
             .map(|_| recordings::path(&self.recordings, id))
     }
 
+    /// Entry `id`'s kept recording, when it kept one and the file is still
+    /// there (Labs › Copy dictation audio).
+    pub fn saved_recording(&self, id: u64) -> Option<PathBuf> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| recordings::saved(&self.recordings, entry))
+    }
+
+    /// The newest entry that kept its audio and still has the file within
+    /// `now_ms`'s retention, if any (Labs › Copy dictation audio's menu and
+    /// tray item).
+    pub fn newest_recording(&self, now_ms: u64) -> Option<PathBuf> {
+        let cutoff = self.retention.cutoff(now_ms);
+        self.entries()
+            .filter(|entry| cutoff.is_none_or(|cutoff| entry.timestamp_ms >= cutoff))
+            .find_map(|entry| recordings::saved(&self.recordings, entry))
+    }
+
     /// Delete every entry. A failed save keeps them, so the clear can be
     /// retried.
     pub fn clear(&mut self) -> io::Result<()> {
@@ -570,10 +595,7 @@ impl HistoryStore {
     /// processing profile. Newest first and bounded.
     pub fn search(&self, query: &str, now_ms: u64) -> Vec<&HistoryEntry> {
         let needle = query.trim().to_lowercase();
-        let cutoff = self
-            .retention
-            .max_age_ms()
-            .map(|max_age| now_ms.saturating_sub(max_age));
+        let cutoff = self.retention.cutoff(now_ms);
         let mut scratch = String::new();
         self.entries()
             .filter(|entry| cutoff.is_none_or(|cutoff| entry.timestamp_ms >= cutoff))
@@ -589,10 +611,7 @@ impl HistoryStore {
         if self.retention.is_off() {
             return Vec::new();
         }
-        let cutoff = self
-            .retention
-            .max_age_ms()
-            .map(|max_age| now_ms.saturating_sub(max_age));
+        let cutoff = self.retention.cutoff(now_ms);
         self.entries()
             .filter(|entry| cutoff.is_none_or(|cutoff| entry.timestamp_ms >= cutoff))
             .filter(|entry| entry.kind != HistoryKind::Printed)
@@ -622,8 +641,7 @@ impl HistoryStore {
 
     fn prune(&mut self, now_ms: u64) -> bool {
         let mut changed = false;
-        if let Some(max_age) = self.retention.max_age_ms() {
-            let cutoff = now_ms.saturating_sub(max_age);
+        if let Some(cutoff) = self.retention.cutoff(now_ms) {
             let before = self.entries.len();
             self.entries.retain(|entry| entry.timestamp_ms >= cutoff);
             changed |= self.entries.len() != before;
@@ -777,6 +795,18 @@ impl History {
 
     pub fn recording_path(&self, id: u64) -> Option<PathBuf> {
         self.synced().recording_path(id)
+    }
+
+    /// Entry `id`'s kept recording, when the file is still there
+    /// ([`HistoryStore::saved_recording`]).
+    pub fn saved_recording(&self, id: u64) -> Option<PathBuf> {
+        self.synced().saved_recording(id)
+    }
+
+    /// The newest entry's kept recording within `now_ms`'s retention, when
+    /// the file is still there ([`HistoryStore::newest_recording`]).
+    pub fn newest_recording(&self, now_ms: u64) -> Option<PathBuf> {
+        self.synced().newest_recording(now_ms)
     }
 
     pub fn set_retention(&self, retention: HistoryRetention) -> io::Result<()> {
@@ -953,6 +983,29 @@ mod tests {
         assert_eq!(ids("same words"), [same]);
         assert_eq!(ids("RAW rewritten"), [rewritten]);
         assert_eq!(ids("no such phrase"), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn the_newest_kept_recording_skips_entries_without_audio_or_without_the_file() {
+        let path = temp_path("newest-recording");
+        let mut store = HistoryStore::open(path, HistoryRetention::Day, 0);
+        assert!(store.newest_recording(0).is_none());
+        let older = store.record(recorded("older"), 1_000).unwrap().unwrap();
+        let plain = store.record(draft("plain"), 2_000).unwrap().unwrap();
+        assert_eq!(store.saved_recording(plain), None);
+        assert_eq!(store.newest_recording(3_000), store.recording_path(older));
+        let newest = store.record(recorded("newest"), 3_000).unwrap().unwrap();
+        assert_eq!(store.newest_recording(4_000), store.recording_path(newest));
+        // A file deleted behind the store's back is skipped, not copied.
+        fs::remove_file(store.recording_path(newest).unwrap()).unwrap();
+        assert_eq!(store.newest_recording(4_000), store.recording_path(older));
+        // Retention applies: exactly at the cutoff remains, past it nothing.
+        let day = HistoryRetention::Day.max_age_ms().unwrap();
+        assert_eq!(
+            store.newest_recording(1_000 + day),
+            store.recording_path(older)
+        );
+        assert_eq!(store.newest_recording(1_000 + day + 1), None);
     }
 
     #[test]

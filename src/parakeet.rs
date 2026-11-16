@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Once;
@@ -52,9 +52,6 @@ pub enum WorkerEvent {
     Stage {
         job_id: DictationJobId,
         stage: DictationJobStage,
-    },
-    Cancelled {
-        job_id: DictationJobId,
     },
     Pasted {
         kind: PasteKind,
@@ -125,6 +122,13 @@ struct InferenceJob {
     language: String,
     /// The clip, kept for History while Labs › Keep recordings is on.
     recording: Option<crate::history::Recording>,
+    /// See [`JobTimings::held_ms`].
+    held_ms: Option<u64>,
+    /// See [`JobTimings::send_gate`].
+    send_gate: crate::dictation::yolo_mode::SendGate,
+    /// Labs › Stop phrase: the words its capture ended with, read when the
+    /// phrase was heard, removed from the transcript before processing.
+    stop_phrase: Option<String>,
 }
 
 struct ProcessorJob {
@@ -147,10 +151,20 @@ struct JobTimings {
     audio_ms: u64,
     prepare_ms: u128,
     inference_ms: u128,
+    /// How long a shortcut-started dictation's shortcut was held, press to
+    /// release; `None` for every other capture. Labs › YOLO mode
+    /// reads it as the paste commits.
+    held_ms: Option<u64>,
+    /// Labs › YOLO mode: whether Escape came after submission, which skips
+    /// the Return.
+    send_gate: crate::dictation::yolo_mode::SendGate,
 }
 
 struct CompletedTranscript {
     text: String,
+    /// Labs › Voice prompt asked for nothing: finish without output even if
+    /// some later stage left text behind.
+    nothing: bool,
     /// Corrected local transcript before mode processing.
     raw: String,
     application: Option<String>,
@@ -170,9 +184,6 @@ enum OutputJob {
         target: TranscriptionTarget,
         result: Box<Result<CompletedTranscript, String>>,
     },
-    Cancelled {
-        job_id: DictationJobId,
-    },
     Paste {
         sequence: u64,
         kind: PasteKind,
@@ -183,7 +194,7 @@ impl OutputJob {
     fn sequence(&self) -> u64 {
         match self {
             Self::PreparePaste => u64::MAX,
-            Self::Completed { job_id, .. } | Self::Cancelled { job_id } => job_id.0,
+            Self::Completed { job_id, .. } => job_id.0,
             Self::Paste { sequence, .. } => *sequence,
         }
     }
@@ -191,18 +202,12 @@ impl OutputJob {
 
 #[derive(Default)]
 struct JobControl {
-    cancelled: AtomicBool,
-    output_started: Mutex<bool>,
     /// A printing stop's reply; dropping the job unanswered tells it the
     /// dictation was cancelled or failed.
     print: Mutex<Option<crate::control::PrintReply>>,
 }
 
 impl JobControl {
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
     fn answer_print(&self, transcript: crate::control::PrintedTranscript) {
         if let Some(reply) = self
             .print
@@ -212,18 +217,6 @@ impl JobControl {
         {
             reply.send(transcript);
         }
-    }
-
-    fn begin_output(&self) -> bool {
-        let mut output_started = self
-            .output_started
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if self.is_cancelled() {
-            return false;
-        }
-        *output_started = true;
-        true
     }
 }
 
@@ -262,11 +255,14 @@ pub struct DictationWorker {
 
 struct WorkerState {
     next_sequence: u64,
-    jobs: BTreeMap<DictationJobId, Arc<JobControl>>,
+    jobs: BTreeSet<DictationJobId>,
     pending_pastes: usize,
     /// Labs › Return to app: the app in front when the capture started,
     /// which its output returns to (macOS).
     return_to: Option<i32>,
+    /// Whether the dictation shortcut, rather than `hex dictation`, started
+    /// the capture now recording (Labs › YOLO mode).
+    started_by_shortcut: bool,
 }
 
 impl WorkerState {
@@ -294,9 +290,10 @@ impl DictationWorker {
         let (event_sender, events) = mpsc::channel();
         let state = Arc::new(Mutex::new(WorkerState {
             next_sequence: 0,
-            jobs: BTreeMap::new(),
+            jobs: BTreeSet::new(),
             pending_pastes: 0,
             return_to: None,
+            started_by_shortcut: false,
         }));
 
         let (_, selection) = crate::app_settings::transcription_selection();
@@ -387,6 +384,14 @@ impl DictationWorker {
         state.return_to = return_to;
     }
 
+    /// Records who started the capture now recording: a dictation shortcut,
+    /// or a `hex dictation` command. Only a shortcut's paste may send
+    /// (Labs › YOLO mode).
+    pub fn set_started_by_shortcut(&self, by_shortcut: bool) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.started_by_shortcut = by_shortcut;
+    }
+
     /// Hands the clip to the engine at once, so its live stream finishes
     /// before any later capture begins one; the job then waits in order.
     pub fn transcribe(
@@ -394,8 +399,9 @@ impl DictationWorker {
         clip: DictationClip,
         target: TranscriptionTarget,
         context: ContextSnapshot,
+        stop_phrase: Option<String>,
     ) -> Result<DictationJobId, &'static str> {
-        self.submit(clip, target, context, None)
+        self.submit(clip, target, context, None, stop_phrase)
     }
 
     /// Like a paste, but the transcript (processed unless `raw`) goes to
@@ -406,13 +412,14 @@ impl DictationWorker {
         print: crate::control::PrintReply,
         raw: bool,
         context: ContextSnapshot,
+        stop_phrase: Option<String>,
     ) -> Result<DictationJobId, &'static str> {
         let target = if raw {
             TranscriptionTarget::RawPrint
         } else {
             TranscriptionTarget::Print
         };
-        self.submit(clip, target, context, Some(print))
+        self.submit(clip, target, context, Some(print), stop_phrase)
     }
 
     fn submit(
@@ -421,6 +428,7 @@ impl DictationWorker {
         target: TranscriptionTarget,
         context: ContextSnapshot,
         print: Option<crate::control::PrintReply>,
+        stop_phrase: Option<String>,
     ) -> Result<DictationJobId, &'static str> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let job_id = DictationJobId(state.next_output_sequence()?);
@@ -437,13 +445,23 @@ impl DictationWorker {
         };
         let control = Arc::new(JobControl {
             print: Mutex::new(print),
-            ..JobControl::default()
         });
         let (_, selection) = crate::app_settings::transcription_selection();
         let language = selection.language.clone();
         let submitted_at = Instant::now();
         let audio_ms = clip.duration_ms();
-        let stream = clip.take_stream();
+        // Labs › YOLO mode: only a shortcut dictation's processed
+        // paste may send, judged on how long its shortcut was held.
+        let held_ms = (matches!(target, TranscriptionTarget::Paste) && state.started_by_shortcut)
+            .then(|| clip.held_ms());
+        let send_gate = crate::dictation::yolo_mode::SendGate::open();
+        // Labs › Screen vocabulary: this capture's terms belong to its
+        // whole-clip run and no other job. Only a model that reads the terms
+        // gives up its live stream, whose vocabulary is fixed when it starts
+        // (before the window was read); a model that ignores them keeps it.
+        let screen_terms = context.screen_terms.clone();
+        let keeps_stream = screen_terms.is_empty() || !crate::dictation::vocabulary::uses_terms();
+        let stream = clip.take_stream().filter(|_| keeps_stream);
         let _capture = clip.take_capture_marker();
         let samples = clip.into_transcription_samples();
         crate::dictation::diagnostics::persist(&samples);
@@ -452,27 +470,22 @@ impl DictationWorker {
             _ => crate::history::Recording::keep(&samples),
         };
         let prepare_ms = submitted_at.elapsed().as_millis();
-        let offline = {
-            let control = control.clone();
-            Box::new(move |model: &mut WarmTranscriber, samples: Vec<f32>| {
-                if control.is_cancelled() {
-                    return Err("dictation was cancelled".to_string());
-                }
-                let _busy = DictationInference::begin();
-                let transcriber = model
-                    .activate(&selection)
-                    .map_err(|error| error.to_string())?;
-                transcriber
-                    .transcribe(samples)
-                    .map_err(|error| error.to_string())
+        let offline = Box::new(move |model: &mut WarmTranscriber, samples: Vec<f32>| {
+            let _busy = DictationInference::begin();
+            let transcriber = model
+                .activate(&selection)
+                .map_err(|error| error.to_string())?;
+            crate::dictation::vocabulary::for_capture(&screen_terms, || {
+                transcriber.transcribe(samples)
             })
-        };
+            .map_err(|error| error.to_string())
+        });
         let transcript = engine
             .finish_with(stream, samples, offline)
             .map_err(|_| "dictation worker is unavailable")?;
         jobs.try_send(InferenceJob {
             job_id,
-            control: control.clone(),
+            control,
             submitted_at,
             transcript,
             audio_ms,
@@ -482,10 +495,13 @@ impl DictationWorker {
             return_to,
             language,
             recording,
+            held_ms,
+            send_gate,
+            stop_phrase,
         })
         .map(|()| {
             state.next_sequence += 1;
-            state.jobs.insert(job_id, control);
+            state.jobs.insert(job_id);
             job_id
         })
         .map_err(queue_error)
@@ -598,13 +614,13 @@ fn run_output_worker(
         for job in ordered.push(job) {
             let event = finish_output(
                 job,
-                &mut |text, mode, commit| paster.paste(text, mode, commit),
+                &mut |text, mode| paster.paste(text, mode),
                 &mut last_transcript,
                 history.as_ref(),
             );
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
             match &event {
-                WorkerEvent::Completed { job_id, .. } | WorkerEvent::Cancelled { job_id } => {
+                WorkerEvent::Completed { job_id, .. } => {
                     state.jobs.remove(job_id);
                 }
                 WorkerEvent::Pasted { .. } => {
@@ -632,10 +648,6 @@ fn run_processor_worker(
             .unwrap_or_else(|error| error.into_inner())
             .recv();
         let Ok(job) = job else { break };
-        if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
-            continue;
-        }
         let mut processed =
             process_job_text(&job, crate::dictation::config::dictation_profiles, || {
                 let _ = events.send(WorkerEvent::Stage {
@@ -646,13 +658,9 @@ fn run_processor_worker(
         processed.apply_transformations(
             transformations,
             &job.context,
-            &job.control.cancelled,
+            &AtomicBool::new(false),
             crate::dictation::processor::Source::Dictation,
         );
-        if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
-            continue;
-        }
         if let Some(observation) = &processed.observation
             && let Some(error) = &observation.fallback
         {
@@ -669,6 +677,7 @@ fn run_processor_worker(
                 target: job.target,
                 result: Box::new(Ok(CompletedTranscript {
                     text: processed.text,
+                    nothing: processed.nothing,
                     raw: job.text,
                     application: job.context.application,
                     return_to: job.return_to,
@@ -691,14 +700,23 @@ fn process_job_text(
     processing: impl FnOnce(),
 ) -> crate::dictation::processor::Processed {
     let profiles = profiles();
-    if profiles.processes(&job.context) {
+    // A voice prompt can run a request even when the mode's own rewrite and
+    // transformations are off, so the HUD shows its stage too.
+    if profiles.processes(&job.context)
+        || profiles.voice_prompts(
+            &job.text,
+            &job.language,
+            &job.context,
+            crate::dictation::processor::Source::Dictation,
+        )
+    {
         processing();
     }
     profiles.process_cancellable(
         &job.text,
         &job.language,
         &job.context,
-        &job.control.cancelled,
+        &AtomicBool::new(false),
         crate::dictation::processor::Source::Dictation,
     )
 }
@@ -816,10 +834,6 @@ fn run_inference_worker(
     events: &mpsc::Sender<WorkerEvent>,
 ) {
     while let Ok(job) = jobs.recv() {
-        if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
-            continue;
-        }
         let _busy = DictationInference::begin();
         let _ = events.send(WorkerEvent::Stage {
             job_id: job.job_id,
@@ -837,6 +851,11 @@ fn run_inference_worker(
                 "transcribed dictation"
             );
             let text = transcribed.text;
+            // Labs › Stop phrase: the words that finished this capture never
+            // reach the text, and a capture that was only the phrase reads as
+            // empty.
+            let text =
+                crate::dictation::stop_phrase::strip_finished(text, job.stop_phrase.as_deref());
             let corrected = if matches!(job.target, TranscriptionTarget::Service) {
                 text.clone()
             } else {
@@ -855,11 +874,9 @@ fn run_inference_worker(
             audio_ms,
             prepare_ms: job.prepare_ms,
             inference_ms: inference_started.elapsed().as_millis(),
+            held_ms: job.held_ms,
+            send_gate: job.send_gate,
         };
-        if job.control.is_cancelled() {
-            let _ = output.send(OutputJob::Cancelled { job_id: job.job_id });
-            continue;
-        }
         let target = job.target;
         match result {
             Ok(text)
@@ -893,6 +910,7 @@ fn run_inference_worker(
                 let result = result.map(|text| CompletedTranscript {
                     raw: text.clone(),
                     text,
+                    nothing: false,
                     application,
                     return_to: job.return_to,
                     timings,
@@ -1023,7 +1041,7 @@ fn queue_error(error: TrySendError<impl Sized>) -> &'static str {
 
 fn finish_output(
     job: OutputJob,
-    paste: &mut impl FnMut(&str, PasteMode, &dyn Fn() -> bool) -> Result<()>,
+    paste: &mut impl FnMut(&str, PasteMode) -> Result<()>,
     last_transcript: &mut Option<String>,
     history: Option<&History>,
 ) -> WorkerEvent {
@@ -1034,19 +1052,16 @@ fn finish_output(
             control,
             target,
             result,
-        } if !control.is_cancelled() => {
+        } => {
             let result = *result;
             let processing = result
                 .as_ref()
                 .ok()
                 .and_then(|result| result.processing.clone());
             let result = result.and_then(|mut completed| {
-                if control.is_cancelled() {
-                    return Err("dictation was cancelled".into());
-                }
                 let paste_started = Instant::now();
-                if !completed.text.trim().is_empty() {
-                    let commit = || control.begin_output();
+                let mut sent = false;
+                if !completed.nothing && !completed.text.trim().is_empty() {
                     match target {
                         TranscriptionTarget::Paste
                         | TranscriptionTarget::CopyOnlyPaste
@@ -1065,6 +1080,15 @@ fn finish_output(
                                 )
                             {
                                 PasteMode::CopyOnly
+                            } else if completed.timings.held_ms.is_some_and(|held_ms| {
+                                crate::dictation::yolo_mode::sends(
+                                    held_ms,
+                                    completed.application.as_deref(),
+                                )
+                            }) {
+                                // Labs › YOLO mode, read as the
+                                // output commits.
+                                PasteMode::Send
                             } else {
                                 PasteMode::Continue
                             };
@@ -1072,31 +1096,38 @@ fn finish_output(
                             // started in comes back first. When it can't,
                             // nothing is pasted; the text stays for Paste
                             // last dictation, and History keeps only pasted
-                            // output, as on any failed paste. A cancelled job
-                            // leaves the last result alone, as it does
-                            // everywhere else.
-                            if matches!(mode, PasteMode::Continue)
+                            // output, as on any failed paste.
+                            if matches!(mode, PasteMode::Continue | PasteMode::Send)
                                 && let Err(error) =
                                     crate::paste::return_to_app::bring_to_front(completed.return_to)
                             {
-                                if !control.is_cancelled() {
-                                    *last_transcript = Some(completed.text.clone());
-                                }
+                                *last_transcript = Some(completed.text.clone());
                                 tracing::warn!(
                                     %error,
                                     "a dictation found another app in front and couldn't return to its own"
                                 );
                                 return Err(error.to_string());
                             }
-                            paste(&completed.text, mode, &commit)
+                            // A paste that fails (another app changed the
+                            // clipboard while Hex saved it) keeps the text
+                            // for Paste last dictation, as above, so the
+                            // dictation isn't lost.
+                            if let Err(error) = paste(&completed.text, mode) {
+                                *last_transcript = Some(completed.text.clone());
+                                return Err(error.to_string());
+                            }
+                            if matches!(mode, PasteMode::Send) {
+                                sent = send_unless_escaped(
+                                    completed.timings.send_gate,
+                                    Instant::now(),
+                                    paste,
+                                );
+                            }
                         }
                         TranscriptionTarget::Service
                         | TranscriptionTarget::Print
-                        | TranscriptionTarget::RawPrint => commit()
-                            .then_some(())
-                            .ok_or_else(|| eyre!("dictation was cancelled")),
+                        | TranscriptionTarget::RawPrint => {}
                     }
-                    .map_err(|error| error.to_string())?;
                     if matches!(
                         target,
                         TranscriptionTarget::Paste
@@ -1107,7 +1138,7 @@ fn finish_output(
                         *last_transcript = Some(completed.text.clone());
                     }
                     if let Some(history) = history {
-                        record_history(history, target, &mut completed);
+                        record_history(history, target, sent, &mut completed);
                     }
                 }
                 tracing::info!(
@@ -1124,8 +1155,7 @@ fn finish_output(
             if matches!(
                 target,
                 TranscriptionTarget::Print | TranscriptionTarget::RawPrint
-            ) && !control.is_cancelled()
-            {
+            ) {
                 control.answer_print(match &result {
                     Ok(text) if text.trim().is_empty() => {
                         crate::control::PrintedTranscript::NoSpeech
@@ -1134,19 +1164,12 @@ fn finish_output(
                     Err(error) => crate::control::PrintedTranscript::Failed(error.clone()),
                 });
             }
-            if control.is_cancelled() {
-                WorkerEvent::Cancelled { job_id }
-            } else {
-                WorkerEvent::Completed {
-                    job_id,
-                    target,
-                    result,
-                    processing,
-                }
+            WorkerEvent::Completed {
+                job_id,
+                target,
+                result,
+                processing,
             }
-        }
-        OutputJob::Completed { job_id, .. } | OutputJob::Cancelled { job_id } => {
-            WorkerEvent::Cancelled { job_id }
         }
         OutputJob::Paste { kind, .. } => {
             let result = match kind {
@@ -1154,8 +1177,7 @@ fn finish_output(
                     .as_deref()
                     .ok_or_else(|| "no previous transcript is available".to_string())
                     .and_then(|text| {
-                        paste(text, PasteMode::Continue, &|| true)
-                            .map_err(|error| error.to_string())?;
+                        paste(text, PasteMode::Continue).map_err(|error| error.to_string())?;
                         Ok(text.to_string())
                     }),
                 PasteKind::MeetingDelta => {
@@ -1167,14 +1189,43 @@ fn finish_output(
     }
 }
 
+/// Labs › YOLO mode, after a `Send` paste landed at `pasted_at`: presses
+/// Return unless Escape came after the release. Returns whether it sent; the
+/// text stays pasted either way.
+fn send_unless_escaped(
+    gate: crate::dictation::yolo_mode::SendGate,
+    pasted_at: Instant,
+    paste: &mut impl FnMut(&str, PasteMode) -> Result<()>,
+) -> bool {
+    if !gate.wait(pasted_at) {
+        tracing::info!("YOLO mode pasted without Return: Escape after the release");
+        return false;
+    }
+    match paste("", PasteMode::Return) {
+        Ok(()) => {
+            tracing::info!(
+                after_submit_ms = gate.submitted_at().elapsed().as_millis(),
+                "YOLO mode pressed Return"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, "YOLO mode could not press Return");
+            false
+        }
+    }
+}
+
 /// Record one successfully pasted result. History failures must never fail
 /// the paste that already happened.
 fn record_history(
     history: &History,
     target: TranscriptionTarget,
+    sent: bool,
     completed: &mut CompletedTranscript,
 ) {
     let kind = match target {
+        TranscriptionTarget::Paste if sent => HistoryKind::Send,
         TranscriptionTarget::Paste | TranscriptionTarget::CopyOnlyPaste => HistoryKind::Dictation,
         TranscriptionTarget::RawPaste | TranscriptionTarget::RawCopyOnlyPaste => HistoryKind::Raw,
         TranscriptionTarget::Print | TranscriptionTarget::RawPrint => HistoryKind::Printed,
@@ -1197,10 +1248,8 @@ fn record_history(
     }
 }
 
-fn paste_meeting_delta(
-    paste: &mut impl FnMut(&str, PasteMode, &dyn Fn() -> bool) -> Result<()>,
-) -> Result<String> {
-    meeting::consume_active_or_latest_delta(|text| paste(text, PasteMode::Standalone, &|| true))
+fn paste_meeting_delta(paste: &mut impl FnMut(&str, PasteMode) -> Result<()>) -> Result<String> {
+    meeting::consume_active_or_latest_delta(|text| paste(text, PasteMode::Standalone))
 }
 
 pub(crate) fn default_model_path() -> Result<std::path::PathBuf> {
@@ -1465,6 +1514,8 @@ mod tests {
                 audio_ms: 1000,
                 prepare_ms: 0,
                 inference_ms: 0,
+                held_ms: None,
+                send_gate: crate::dictation::yolo_mode::SendGate::open(),
             },
             recording: None,
         }
@@ -1568,6 +1619,46 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_paste_keeps_the_dictation_for_paste_last() {
+        let text = "the dictation whose paste failed";
+        let mut last_transcript = Some("an older dictation".to_string());
+        let event = finish_output(
+            OutputJob::Completed {
+                job_id: DictationJobId(1),
+                control: Arc::new(JobControl::default()),
+                target: TranscriptionTarget::Paste,
+                result: Box::new(Ok(CompletedTranscript {
+                    text: text.into(),
+                    nothing: false,
+                    raw: text.into(),
+                    application: None,
+                    return_to: None,
+                    timings: JobTimings {
+                        total_started: Instant::now(),
+                        queue_ms: 0,
+                        audio_ms: 2_000,
+                        prepare_ms: 0,
+                        inference_ms: 0,
+                        held_ms: None,
+                        send_gate: crate::dictation::yolo_mode::SendGate::open(),
+                    },
+                    processing: None,
+                    recording: None,
+                })),
+            },
+            &mut |_, _| Err(eyre!("clipboard changed while Hex was preserving it")),
+            &mut last_transcript,
+            None,
+        );
+
+        assert!(matches!(
+            event,
+            WorkerEvent::Completed { result: Err(_), .. }
+        ));
+        assert_eq!(last_transcript.as_deref(), Some(text));
+    }
+
+    #[test]
     fn a_salvaged_dictation_is_copied_and_kept_for_paste_last_and_history() {
         // A normal salvage is processed before it is copied; a raw one is
         // copied as heard and recorded as raw history. Neither is pasted.
@@ -1596,6 +1687,7 @@ mod tests {
                     target,
                     result: Box::new(Ok(CompletedTranscript {
                         text: text.into(),
+                        nothing: false,
                         raw: text.into(),
                         application: Some("Call".into()),
                         return_to: None,
@@ -1605,13 +1697,14 @@ mod tests {
                             audio_ms: 4_000,
                             prepare_ms: 0,
                             inference_ms: 0,
+                            held_ms: None,
+                            send_gate: crate::dictation::yolo_mode::SendGate::open(),
                         },
                         processing: None,
                         recording: None,
                     })),
                 },
-                &mut |pasted_text, mode, commit| {
-                    assert!(commit());
+                &mut |pasted_text, mode| {
                     pasted = Some((pasted_text.to_string(), mode));
                     Ok(())
                 },
@@ -1640,6 +1733,75 @@ mod tests {
             assert_eq!(entries[0].application.as_deref(), Some("Call"));
             let _ = std::fs::remove_dir_all(&directory);
         }
+    }
+
+    /// Labs › YOLO mode: Escape after the release keeps the paste and skips
+    /// the Return, so History records a dictation rather than a send.
+    #[test]
+    fn escape_after_release_pastes_a_yolo_dictation_without_return() {
+        use crate::dictation::yolo_mode::{ESCAPE_WINDOW, SendGate};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ESCAPES: AtomicU64 = AtomicU64::new(0);
+        let submitted = Instant::now() - ESCAPE_WINDOW;
+        let presses = std::cell::RefCell::new(Vec::new());
+        let mut paste = |text: &str, mode| {
+            presses
+                .borrow_mut()
+                .push((text.to_owned(), matches!(mode, PasteMode::Return)));
+            Ok(())
+        };
+
+        let gate = SendGate::on(&ESCAPES, submitted);
+        ESCAPES.fetch_add(1, Ordering::AcqRel);
+        assert!(!send_unless_escaped(gate, submitted, &mut paste));
+        assert!(presses.borrow().is_empty(), "no Return after an Escape");
+
+        let gate = SendGate::on(&ESCAPES, submitted);
+        assert!(send_unless_escaped(gate, submitted, &mut paste));
+        assert_eq!(*presses.borrow(), [(String::new(), true)]);
+
+        let failing = SendGate::on(&ESCAPES, submitted);
+        assert!(!send_unless_escaped(failing, submitted, &mut |_, _| Err(
+            eyre!("Return failed")
+        )));
+
+        let directory =
+            std::env::temp_dir().join(format!("hex-parakeet-yolo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let history = History::new(crate::history::HistoryStore::open(
+            directory.join("history.json"),
+            crate::history::HistoryRetention::Week,
+            crate::history::now_ms(),
+        ));
+        for sent in [false, true] {
+            let mut completed = CompletedTranscript {
+                text: "a long message".into(),
+                nothing: false,
+                raw: "a long message".into(),
+                application: None,
+                return_to: None,
+                timings: JobTimings {
+                    total_started: Instant::now(),
+                    queue_ms: 0,
+                    audio_ms: 3_000,
+                    prepare_ms: 0,
+                    inference_ms: 0,
+                    held_ms: Some(3_000),
+                    send_gate: SendGate::open(),
+                },
+                processing: None,
+                recording: None,
+            };
+            record_history(&history, TranscriptionTarget::Paste, sent, &mut completed);
+        }
+        let kinds: Vec<_> = history
+            .recent(2)
+            .into_iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert!(kinds.contains(&HistoryKind::Dictation) && kinds.contains(&HistoryKind::Send));
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -1681,9 +1843,10 @@ mod tests {
             event_sender,
             state: Arc::new(Mutex::new(WorkerState {
                 next_sequence: 1,
-                jobs: BTreeMap::from([(DictationJobId(0), Arc::new(JobControl::default()))]),
+                jobs: BTreeSet::from([DictationJobId(0)]),
                 pending_pastes: 0,
                 return_to: None,
+                started_by_shortcut: false,
             })),
             inference_worker: None,
             processor_workers: Vec::new(),
@@ -1708,33 +1871,6 @@ mod tests {
             output_receiver.try_recv().unwrap().sequence(),
             MAX_PENDING_OUTPUTS as u64
         );
-    }
-
-    #[test]
-    fn cancellation_replaces_waiting_output_and_ignores_late_completion() {
-        let mut outputs = OrderedOutputs::default();
-        let completed = |sequence| OutputJob::Completed {
-            job_id: DictationJobId(sequence),
-            control: Arc::new(JobControl::default()),
-            target: TranscriptionTarget::Paste,
-            result: Box::new(Err("late result".into())),
-        };
-
-        assert!(outputs.push(completed(1)).is_empty());
-        assert!(
-            outputs
-                .push(OutputJob::Cancelled {
-                    job_id: DictationJobId(1),
-                })
-                .is_empty()
-        );
-        let ready = outputs.push(OutputJob::Paste {
-            sequence: 0,
-            kind: PasteKind::LastTranscript,
-        });
-        assert_eq!(ready.len(), 2);
-        assert!(matches!(ready[1], OutputJob::Cancelled { .. }));
-        assert!(outputs.push(completed(1)).is_empty());
     }
 
     /// Replays recordings into the production engine as capture would (160 ms

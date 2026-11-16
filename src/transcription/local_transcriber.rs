@@ -215,12 +215,6 @@ pub fn transcribe_wav_with_selection(
     LocalTranscriber::load(selection)?.transcribe(&samples)
 }
 
-/// A WAV already in memory, as `hex transcribe` read it.
-pub fn transcribe_wav_bytes(wav: &[u8], selection: &TranscriptionSelection) -> Result<String> {
-    let samples = read_wav(std::io::Cursor::new(wav))?;
-    LocalTranscriber::load(selection)?.transcribe(&samples)
-}
-
 pub fn read_wav_for_parakeet(path: &Path) -> Result<Vec<f32>> {
     let file =
         std::fs::File::open(path).wrap_err_with(|| format!("could not open {}", path.display()))?;
@@ -654,6 +648,7 @@ impl LocalTranscriber {
         &mut self,
         samples: &[f32],
     ) -> Result<crate::transcription::transcript::Transcript> {
+        use crate::transcription::gguf_session::{chunk_ranges, sample_offset_ms};
         use crate::transcription::transcript::TranscriptSegment;
         const CHUNK: usize = 30 * 16_000;
         let chunk = self.max_audio_samples.map_or(CHUNK, |max| max.min(CHUNK));
@@ -671,11 +666,11 @@ impl LocalTranscriber {
         };
         let mut timed = crate::transcription::transcript::Transcript::default();
         let mut texts = Vec::new();
-        for (index, part) in samples.chunks(chunk.max(1)).enumerate() {
-            let offset = (index * chunk / 16) as i64;
+        for range in chunk_ranges(samples, chunk) {
+            let offset = sample_offset_ms(range.start);
             let transcript = self
                 .session
-                .run(part, &options)
+                .run(&samples[range], &options)
                 .wrap_err("transcription failed")?;
             let text = transcript.text.trim();
             if !text.is_empty() {

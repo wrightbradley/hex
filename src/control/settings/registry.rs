@@ -16,6 +16,8 @@ pub(super) enum Kind {
         max: u64,
     },
     Choice(&'static [&'static str]),
+    /// A choice whose values are whole numbers in settings.json.
+    NumberChoice(&'static [&'static str]),
     Text,
     Shortcut(HotkeySlot),
     Path,
@@ -28,7 +30,7 @@ impl Kind {
             Self::Bool => "bool",
             Self::Number { .. } => "number",
             Self::Integer { .. } => "integer",
-            Self::Choice(_) => "choice",
+            Self::Choice(_) | Self::NumberChoice(_) => "choice",
             Self::Text => "text",
             Self::Shortcut(_) => "shortcut",
             Self::Path => "path",
@@ -79,10 +81,6 @@ const fn read_only(key: &'static str, kind: Kind, about: &'static str, why: &'st
 
 const UNIT: Kind = Kind::Number { min: 0.0, max: 1.0 };
 const MODEL_CHANGE: &str = "change the transcription model with `hex model use`";
-
-/// Choice keys whose values are numbers in settings.json.
-pub(super) const NUMERIC_CHOICES: [&str; 2] =
-    ["meetings.calendar.lead_minutes", "labs.unload_idle_minutes"];
 
 pub(super) const KEYS: &[Key] = &[
     key(
@@ -320,6 +318,16 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: bias Parakeet transcription toward the vocabulary",
     ),
     key(
+        "labs.screen_vocabulary",
+        Kind::Bool,
+        "Labs: use names and terms visible in the focused window as temporary vocabulary for each dictation (macOS)",
+    ),
+    key(
+        "labs.cursor_context",
+        Kind::Bool,
+        "Labs: the mode's OpenCode rewrite reads the text around the cursor, so names and terms match where the result lands (macOS); password fields are never read",
+    ),
+    key(
         "labs.mouse_shortcuts",
         Kind::Bool,
         "Labs: record mouse buttons as shortcuts (macOS)",
@@ -331,13 +339,18 @@ pub(super) const KEYS: &[Key] = &[
     ),
     key(
         "labs.unload_idle_minutes",
-        Kind::Choice(&["5", "15", "30", "60"]),
+        Kind::NumberChoice(&["5", "15", "30", "60"]),
         "Minutes unused before Labs › Unload model when idle unloads the model",
     ),
     key(
-        "labs.restore_shortcut_default",
+        "labs.keep_microphone_open",
         Kind::Bool,
-        "Labs: offer Restore default beside the Paste last dictation shortcut",
+        "Labs: with Release microphone while idle on, keep the microphone open for a while after each dictation so the next one starts at once",
+    ),
+    key(
+        "labs.keep_microphone_open_seconds",
+        Kind::NumberChoice(&["30", "60", "180", "300", "1800"]),
+        "Seconds the microphone stays open after a dictation with Labs › Keep mic open after dictating on: 30 s, 1, 3, 5, or 30 minutes",
     ),
     key(
         "labs.keep_on_clipboard",
@@ -370,9 +383,9 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: remove filler words such as um and uh from dictations, without an AI model",
     ),
     key(
-        "labs.subtitle_export",
+        "labs.clean_up_with_apple_intelligence",
         Kind::Bool,
-        "Labs: export meeting transcripts as SRT or VTT subtitles with hex meetings show --srt|--vtt",
+        "Labs: fix clearly misheard words and spoken self-corrections in each dictation, on this Mac with Apple Intelligence",
     ),
     key(
         "labs.second_dictation_shortcut",
@@ -424,6 +437,13 @@ pub(super) const KEYS: &[Key] = &[
          modifiers such as Option, Globe, or ⌃⌥ (macOS)",
     ),
     key(
+        "labs.hold_through_keys",
+        Kind::Bool,
+        "Labs: a key or click joining a held shortcut with no key a second or more after it \
+         went down reaches the app in front and leaves the dictation recording, which the \
+         release still finishes (macOS and Windows)",
+    ),
+    key(
         "labs.benchmark_details",
         Kind::Bool,
         "Labs: the Local transcription picker shows each model's raw error rate (WER or CER), benchmark, source, and conditions",
@@ -445,9 +465,20 @@ pub(super) const KEYS: &[Key] = &[
          with no modifier (Linux, macOS); off puts such a shortcut back to its default",
     ),
     key(
+        "labs.microphone_key",
+        Kind::Bool,
+        "Labs: a shortcut may be the microphone (dictation) key in a laptop keyboard's top row \
+         with no modifier (macOS); off puts such a shortcut back to its default",
+    ),
+    key(
         "labs.keep_recordings",
         Kind::Bool,
         "Labs: dictations saved to History keep their audio, so History can transcribe them again with another model; off stops saving, clearing History deletes it",
+    ),
+    key(
+        "labs.copy_dictation_audio",
+        Kind::Bool,
+        "Labs: History entries with a kept recording offer Copy audio, and the menu bar or tray offers Copy last dictation audio; copies the kept WAV as a file and stores no audio itself, so it needs Labs: keep recordings",
     ),
     key(
         "labs.history_stats",
@@ -505,31 +536,6 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: a dictation transcribed as a whole clip hears only the start and end of each long pause, so slow computers paste sooner (Linux and Windows)",
     ),
     key(
-        "labs.stop_when_call_ends",
-        Kind::Bool,
-        "Labs: a meeting recording Hex started on its own stops 30 s after its call app leaves the microphone and goes quiet, unless you keep recording (macOS)",
-    ),
-    key(
-        "labs.more_call_apps",
-        Kind::Bool,
-        "Labs: offer to record calls in Signal, Telegram, WeChat, LINE, Webex, Element and the Phone app, and name calls on Google Voice, Messenger, Teams, FaceTime, GroupMe, and Webex pages",
-    ),
-    key(
-        "labs.movable_meeting_capsules",
-        Kind::Bool,
-        "Labs: drag meeting capsules such as Meeting transcript ready out of the way; they show in the corner you left them, shared with the recording capsule (macOS)",
-    ),
-    key(
-        "labs.meeting_notes_vocabulary",
-        Kind::Bool,
-        "Labs: final meeting titles and summaries read the vocabulary, so names are spelled the way you wrote them",
-    ),
-    key(
-        "labs.meeting_finished_event",
-        Kind::Bool,
-        "Labs: the local API's GET /meetings/events tells one subscriber each finished meeting's id once its final transcript is written; no transcript, audio, path, or title",
-    ),
-    key(
         "labs.screenshots",
         Kind::Bool,
         "Labs: screenshots.hotkey (command+shift+4) drags out an area or, after space, picks a window; the PNG is copied and saved to screenshots.folder (macOS)",
@@ -538,6 +544,11 @@ pub(super) const KEYS: &[Key] = &[
         "labs.annotate_replay",
         Kind::Bool,
         "Labs: keep a rolling 15-second screen buffer so hex capture replay or capture.replay_hotkey saves what just happened; macOS shows the screen-recording dot the whole time it's on (macOS 27+)",
+    ),
+    key(
+        "labs.copy_capture_zip",
+        Kind::Bool,
+        "Labs: a finished Annotate capture copies to the clipboard as one light zip file you can attach anywhere, without its video and audio (macOS, Linux, Windows)",
     ),
     key(
         "labs.gnome_clipboard_restore",
@@ -560,29 +571,9 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: on Wayland desktops without layer-shell, such as GNOME, Annotate's capsule and ink float over the screen through XWayland while it is already running; Esc can't stop drawing there, so use the capsule's pen button or let go of a held Annotate key (Linux)",
     ),
     key(
-        "labs.follow_live_transcript",
-        Kind::Bool,
-        "Labs: while a meeting records, its transcript in Meetings scrolls to the newest line; scroll up to read earlier text, back to the bottom to follow again",
-    ),
-    key(
         "labs.meeting_import",
         Kind::Bool,
         "Labs: Meetings offers Import audio…, so a local audio file is transcribed and kept as a meeting (macOS)",
-    ),
-    key(
-        "labs.meeting_descriptive_filenames",
-        Kind::Bool,
-        "Labs: an exported meeting's Markdown follows its title once notes or a rename provide one, keeping the date and time",
-    ),
-    key(
-        "labs.meeting_notes_file",
-        Kind::Bool,
-        "Labs: a meeting's notes are written to their own file beside the transcript, sharing its name and linking back to it",
-    ),
-    key(
-        "labs.expire_meeting_audio",
-        Kind::Bool,
-        "Labs: finished meetings drop their WAVs on meetings.audio_retention while their transcripts, notes, summary, and Markdown stay",
     ),
     key(
         "labs.output_fixes",
@@ -600,14 +591,36 @@ pub(super) const KEYS: &[Key] = &[
         "Labs: the speech model picker's Use model file where it is… adds a GGUF file without copying it, so several accounts can share one file",
     ),
     key(
+        "labs.k_quant_models",
+        Kind::Bool,
+        "Labs: add your own speech model files that use Q6_K, Q5_K, or Q4_K weights (macOS); they are smaller than Q8_0 but Hex hasn't verified them",
+    ),
+    key(
         "labs.picker_downloaded",
         Kind::Bool,
         "Labs: the speech model picker's All speech models view offers Only downloaded models, with the space they take",
     ),
     key(
-        "labs.transcribe_files",
+        "labs.shell_completions",
         Kind::Bool,
-        "Labs: hex transcribe <file> turns a WAV recording into text with the selected dictation model",
+        "Labs: hex completions <shell> prints a completion script for bash, zsh, fish, elvish, or \
+         PowerShell, generated from Hex's own commands",
+    ),
+    key(
+        "labs.yolo_mode",
+        Kind::Bool,
+        "Labs: a shortcut dictation held for at least labs.yolo_mode_seconds presses Return after pasting",
+    ),
+    key(
+        "labs.yolo_mode_seconds",
+        Kind::NumberChoice(&["1", "2", "3", "5", "10"]),
+        "Seconds a dictation shortcut must be held for Labs › YOLO mode to press Return: 1, 2, 3, 5, or 10",
+    ),
+    key(
+        "labs.yolo_mode_apps",
+        Kind::Json,
+        "Labs: the apps YOLO mode presses Return in, as a JSON list of \
+         application names as Modes match them; an empty list means every app",
     ),
     key(
         "labs.api_processing",
@@ -622,16 +635,65 @@ pub(super) const KEYS: &[Key] = &[
          in a transcript, as the speech model heard them (timestamps=segment|word)",
     ),
     key(
+        "labs.api_browser_access",
+        Kind::Bool,
+        "Labs: web pages from the origins in labs.api_browser_origins can call Hex's local API \
+         from the browser; every request still needs the API token",
+    ),
+    key(
+        "labs.api_browser_origins",
+        Kind::Json,
+        "Labs: the browser origins allowed to call Hex's local API, as a JSON list of \
+         http:// or https:// scheme://host[:port] origins; an entry that isn't one is ignored",
+    ),
+    key(
         "labs.speakers_only",
         Kind::Bool,
         "Labs: While dictating applies only while the default output is speakers; headphones are \
          left alone, and outputs Hex can't classify count as speakers",
     ),
     key(
+        "labs.calendar_menu",
+        Kind::Bool,
+        "Labs: the menu bar lists the next calendar meetings, each a local start and end time and \
+         title; choosing one that has a call link opens it, and that click doesn't start a \
+         recording (macOS, with Meetings on and a calendar connected)",
+    ),
+    key(
         "labs.pause_menu",
         Kind::Bool,
         "Labs: the menu bar offers Pause Hex, which makes every capture shortcut inert until \
          Resume; a restart starts unpaused (macOS)",
+    ),
+    key(
+        "labs.print_start",
+        Kind::Bool,
+        "Labs: `hex dictation start --print` records a dictation whose transcript goes to \
+         that command, never pasted or copied, however the recording ends (macOS)",
+    ),
+    key(
+        "labs.voice_prompt",
+        Kind::Bool,
+        "Labs: a spoken phrase inside a dictation hands the mode's OpenCode model a one-off \
+         instruction for that dictation",
+    ),
+    key(
+        "labs.voice_prompt_phrase",
+        Kind::Text,
+        "Labs: the words that start a voice prompt, at least two words and six letters; \
+         \"rewrite this\" by default",
+    ),
+    key(
+        "labs.stop_phrase",
+        Kind::Bool,
+        "Labs: a spoken phrase at the end of a hands-free dictation finishes it, as if the \
+         shortcut were pressed again",
+    ),
+    key(
+        "labs.stop_phrase_text",
+        Kind::Text,
+        "Labs: the phrase that finishes a hands-free dictation, at least two words and six \
+         letters; \"stop dictation\" by default",
     ),
     key(
         "meetings.enabled",
@@ -651,7 +713,7 @@ pub(super) const KEYS: &[Key] = &[
     optional(
         "meetings.opencode_model",
         Kind::Text,
-        "The OpenCode provider/model meeting notes use when meetings.summaries is opencode; none lets Hex pick a fast model",
+        "The OpenCode provider/model meeting notes use when meetings.summaries is opencode; none uses OpenCode's default model",
     ),
     key(
         "meetings.show_recording_indicator",
@@ -671,7 +733,22 @@ pub(super) const KEYS: &[Key] = &[
     optional(
         "meetings.audio_retention",
         Kind::Choice(&["day", "week", "month", "forever"]),
-        "How long finished meetings keep their audio with Labs › Expire meeting audio separately on; none follows meetings.retention",
+        "How long finished meetings keep their audio while their transcripts, notes, summary, and Markdown stay; none follows meetings.retention",
+    ),
+    key(
+        "meetings.stop_when_call_ends",
+        Kind::Bool,
+        "A meeting recording Hex started on its own stops 30 s after its call app leaves the microphone and goes quiet, unless you keep recording (macOS)",
+    ),
+    key(
+        "meetings.export.descriptive_filenames",
+        Kind::Bool,
+        "An exported meeting's Markdown follows its title once notes or a rename provide one, keeping the date and time",
+    ),
+    key(
+        "meetings.export.notes_file",
+        Kind::Bool,
+        "A meeting's notes are written to their own file beside the transcript, sharing its name and linking back to it",
     ),
     key(
         "meetings.providers",
@@ -696,7 +773,7 @@ pub(super) const KEYS: &[Key] = &[
     ),
     key(
         "meetings.calendar.lead_minutes",
-        Kind::Choice(&["0", "1", "2", "5"]),
+        Kind::NumberChoice(&["0", "1", "2", "5"]),
         "Minutes before a meeting its reminder shows",
     ),
     key(
@@ -848,6 +925,16 @@ pub(super) const RETIRED: &[(&str, &str)] = &[
         "meetings.summarize_with_opencode",
         "meetings.summaries opencode",
     ),
+    (
+        "labs.stop_when_call_ends",
+        "meetings.stop_when_call_ends true",
+    ),
+    (
+        "labs.meeting_descriptive_filenames",
+        "meetings.export.descriptive_filenames true",
+    ),
+    ("labs.meeting_notes_file", "meetings.export.notes_file true"),
+    ("labs.expire_meeting_audio", "meetings.audio_retention week"),
 ];
 
 /// Settings that act only where Hex has a capability (by its
@@ -857,15 +944,6 @@ pub(super) const NEEDS: &[(&str, &str)] = &[
     ("meetings.calendar.", "calendar"),
     ("meetings.", "meetings"),
     ("labs.live_chapters", "meetings"),
-    ("labs.subtitle_export", "meetings"),
-    ("labs.stop_when_call_ends", "meetings"),
-    ("labs.more_call_apps", "meetings"),
-    ("labs.movable_meeting_capsules", "meetings"),
-    ("labs.meeting_notes_vocabulary", "meetings"),
-    ("labs.meeting_finished_event", "meetings"),
-    ("labs.meeting_descriptive_filenames", "meetings"),
-    ("labs.meeting_notes_file", "meetings"),
-    ("labs.follow_live_transcript", "meetings"),
     ("experimental.hex_microphone", "fun"),
     ("typed_text_hotkey", "typed_text"),
     ("show_dock_icon", "dock_icon"),

@@ -12,7 +12,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use serde::{Deserialize, Serialize};
 
 use crate::desktop::events::now_ms;
-use crate::durable::{sync_directory, sync_file};
+use crate::durable::{lock_contended, sync_directory, sync_file};
 
 const SAMPLE_RATE: u32 = 16_000;
 const TRANSCRIPT_TURN_GAP_MS: u64 = 3_000;
@@ -26,6 +26,7 @@ const IMPORT_PENDING_FILE: &str = "import.pending";
 
 mod capture;
 mod chapters;
+mod chunk_level;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod detection;
 #[cfg(target_os = "linux")]
@@ -69,6 +70,7 @@ mod transcript;
 mod warning;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod watcher;
+pub use capture::track_levels;
 #[cfg(all(debug_assertions, target_os = "macos"))]
 pub use chapters::chapters_file;
 #[cfg(target_os = "macos")]
@@ -80,7 +82,7 @@ pub use notes::{MeetingNotes, display_title, notes_in_progress, notes_wanted, sp
 pub use notes::{summarize, summarize_file};
 #[cfg(test)]
 pub use retention::audio_expired;
-pub use retention::{expire, expire_audio, expired, retention_for};
+pub use retention::{expire, expire_audio, list, retention_for};
 pub use transcript::TranscriptReader;
 pub use warning::TrackWarning;
 
@@ -218,7 +220,7 @@ pub struct MeetingManifest {
     /// user edited stays.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_sha256: Option<String>,
-    /// The notes file beside the transcript while Labs › Separate notes file
+    /// The notes file beside the transcript while Separate notes file
     /// wrote one, tracked so renames, Trash, and retention follow it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_export_path: Option<PathBuf>,
@@ -231,8 +233,8 @@ pub struct MeetingManifest {
     /// and never writes another notes file for this meeting.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub notes_export_removed: bool,
-    /// When the meeting's WAV tracks moved to the Trash (Labs › Expire
-    /// meeting audio separately); the transcript, notes, and Markdown stay.
+    /// When the meeting's WAV tracks moved to the Trash (Meetings ›
+    /// Settings › Keep audio); the transcript, notes, and Markdown stay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_removed_at_ms: Option<u64>,
     /// Imported from an audio file rather than recorded: one speaker track,
@@ -955,7 +957,7 @@ fn transcribe(
         &crate::app_settings::meeting_output_folder(),
         manifest,
         &transcript,
-        crate::labs::meeting_notes_file(),
+        crate::app_settings::meeting_notes_file(),
     ) {
         Ok(path) => {
             tracing::info!(path = %path.display(), "published meeting transcript");
@@ -1013,7 +1015,8 @@ pub fn finish_pending(id: &str) -> Result<Option<MeetingManifest>> {
     finish::finish_transcription(&directory, manifest, &selection).map(Some)
 }
 
-pub fn list() -> Result<Vec<MeetingManifest>> {
+/// Maintenance must still see expired folders, including failed Trash attempts.
+fn list_all() -> Result<Vec<MeetingManifest>> {
     let root = root()?;
     let mut meetings = Vec::new();
     for entry in match fs::read_dir(root) {
@@ -1083,13 +1086,6 @@ fn meeting_is_active(directory: &Path) -> Option<bool> {
             None
         }
     }
-}
-
-/// Whether a failed try-lock means another handle holds the lock: `flock`'s
-/// `EWOULDBLOCK` on Unix, `ERROR_LOCK_VIOLATION` on Windows.
-fn lock_contended(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::WouldBlock
-        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
 fn recovered_status(
@@ -1264,8 +1260,8 @@ fn text_sha256(bytes: &[u8]) -> String {
 }
 
 /// Renames a meeting. The Markdown heading follows only while it still reads
-/// the previous title. The file keeps its name unless Labs › Descriptive
-/// meeting file names is on, which renames it to the new title.
+/// the previous title. The file keeps its name unless Descriptive meeting file
+/// names is on, which renames it to the new title.
 pub fn rename(id: &str, title: &str) -> Result<MeetingManifest> {
     rename_meeting(&root()?.join(id), title)
 }
@@ -1274,7 +1270,7 @@ fn rename_meeting(directory: &Path, title: &str) -> Result<MeetingManifest> {
     rename_meeting_with(
         directory,
         title,
-        crate::labs::meeting_descriptive_filenames(),
+        crate::app_settings::meeting_descriptive_filenames(),
     )
 }
 

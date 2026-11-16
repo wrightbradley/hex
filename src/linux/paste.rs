@@ -3,6 +3,7 @@ use std::io::{ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -26,6 +27,7 @@ use crate::linux::session::LinuxSession;
 const XK_A: u32 = 0x61;
 const XK_C: u32 = 0x63;
 const XK_V: u32 = 0x76;
+const XK_RETURN: u32 = 0xff0d;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(3);
 const PASTE_SETTLE: Duration = Duration::from_millis(100);
 const PORTAL_FOCUS_SETTLE: Duration = Duration::from_millis(250);
@@ -156,6 +158,8 @@ pub(crate) enum Chord {
     SelectAll,
     Copy,
     Paste,
+    /// Return alone, after a paste (Labs › YOLO mode).
+    Return,
 }
 
 impl WaylandKeys {
@@ -347,6 +351,48 @@ fn copied_only(
     )
 }
 
+/// `path` as a `text/uri-list` entry: one absolute `file://` URI, CRLF
+/// terminated, with everything but unreserved characters and `/`
+/// percent-encoded.
+fn file_uri(path: &Path) -> Result<String> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| eyre!("not a UTF-8 path: {}", path.display()))?;
+    if !path.is_absolute() {
+        return Err(eyre!("not an absolute path: {}", path.display()));
+    }
+    let mut uri = String::from("file://");
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            uri.push(byte as char);
+        } else {
+            uri.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    uri.push_str("\r\n");
+    Ok(uri)
+}
+
+/// The process's one paster for copies that outlive the call, such as a file
+/// on the clipboard: on X11 it serves the clipboard for as long as it lives,
+/// so what it copied stays pasteable. Built on first use from the saved
+/// terminal-paste preference.
+pub(crate) fn with_paster(use_it: impl FnOnce(&mut LinuxPaster) -> Result<()>) -> Result<()> {
+    static PASTER: Mutex<Option<LinuxPaster>> = Mutex::new(None);
+    let mut paster = PASTER.lock().unwrap_or_else(|error| error.into_inner());
+    if paster.is_none() {
+        let shift = crate::app_settings::AppSettings::load()
+            .map(|settings| settings.paste_with_shift)
+            .unwrap_or(false);
+        *paster = Some(LinuxPaster::new(
+            Arc::default(),
+            Arc::new(AtomicBool::new(shift)),
+            Default::default(),
+        )?);
+    }
+    use_it(paster.as_mut().expect("made above"))
+}
+
 impl LinuxPaster {
     pub(crate) fn new(
         stop: Arc<AtomicBool>,
@@ -392,6 +438,35 @@ impl LinuxPaster {
                 let mut copy = Command::new("wl-copy");
                 copy.args(["--type", "text/plain;charset=utf-8"]);
                 run_helper(copy, text.as_bytes(), &self.stop, HELPER_TIMEOUT)
+                    .wrap_err("could not own the Wayland clipboard; install wl-clipboard")
+            }
+        }
+    }
+
+    /// Puts `path` on the clipboard as a `text/uri-list` file, so a chat app
+    /// or agent attaches the file itself (Labs › Copy captures as a zip).
+    pub(crate) fn copy_file_uri(&mut self, path: &Path) -> Result<()> {
+        let uri = file_uri(path)?;
+        let mut restore = self.restore.lock().unwrap_or_else(PoisonError::into_inner);
+        restore.keep();
+        match &mut self.backend {
+            Backend::X11(paster) => {
+                let target = paster
+                    .clipboard
+                    .getter
+                    .get_atom("text/uri-list")
+                    .wrap_err("could not name the X11 text/uri-list target")?;
+                let atoms = &paster.clipboard.getter.atoms;
+                paster
+                    .clipboard
+                    .store(atoms.clipboard, target, uri.as_bytes())
+                    .wrap_err("could not own the X11 clipboard")
+            }
+            Backend::Wayland(_) => {
+                require_wl_copy()?;
+                let mut copy = Command::new(WL_COPY);
+                copy.args(["--type", "text/uri-list"]);
+                run_helper(copy, uri.as_bytes(), &self.stop, HELPER_TIMEOUT)
                     .wrap_err("could not own the Wayland clipboard; install wl-clipboard")
             }
         }
@@ -470,7 +545,15 @@ impl LinuxPaster {
         self.selection.current().restore(snapshot)
     }
 
-    /// Sends Ctrl+A, Ctrl+C, or Ctrl+V through this session's key path.
+    /// Labs › YOLO mode: presses Return after a paste, once the
+    /// paste has had [`crate::dictation::yolo_mode::SETTLE`] to land.
+    pub(crate) fn press_return(&mut self) -> Result<()> {
+        thread::sleep(crate::dictation::yolo_mode::SETTLE);
+        self.send_chord(Chord::Return)
+    }
+
+    /// Sends Ctrl+A, Ctrl+C, Ctrl+V, or Return through this session's key
+    /// path.
     fn send_chord(&mut self, chord: Chord) -> Result<()> {
         match &mut self.backend {
             Backend::X11(paster) => paster.chord(chord, &self.stop, &self.keys),
@@ -657,13 +740,18 @@ impl X11Paster {
         })
     }
 
-    /// Sends Ctrl+A, Ctrl+C, or Ctrl+V without touching the clipboard.
+    /// Sends Ctrl+A, Ctrl+C, Ctrl+V, or Return without touching the
+    /// clipboard.
     fn chord(&mut self, chord: Chord, stop: &AtomicBool, keys: &ShortcutKeys) -> Result<()> {
         self.wait_for_modifier_release(stop, keys)?;
         let key = match chord {
             Chord::SelectAll => self.keymap.keycode(XK_A)?,
             Chord::Copy => self.keymap.keycode(XK_C)?,
             Chord::Paste => self.v,
+            Chord::Return => {
+                let key = self.keymap.keycode(XK_RETURN)?;
+                return self.send_keys(&[(KEY_PRESS, key), (KEY_RELEASE, key)]);
+            }
         };
         self.send_keys(&[
             (KEY_PRESS, self.control),
@@ -777,6 +865,7 @@ impl X11Paster {
 const EVDEV_KEY_A: usize = 30;
 const EVDEV_KEY_C: usize = 46;
 const EVDEV_KEY_V: usize = 47;
+const EVDEV_KEY_ENTER: usize = 28;
 
 fn chord_keys(chord: Chord, with_shift: bool) -> Vec<String> {
     let (key, evdev, shift) = match chord {
@@ -784,7 +873,9 @@ fn chord_keys(chord: Chord, with_shift: bool) -> Vec<String> {
         Chord::Copy => ("c", EVDEV_KEY_C, false),
         // Only a paste reads the terminal-paste preference.
         Chord::Paste => ("v", EVDEV_KEY_V, with_shift),
+        Chord::Return => ("Return", EVDEV_KEY_ENTER, false),
     };
+    let control = chord != Chord::Return;
     // wtype numbers its keymap in order of first use from evdev code 1, so a
     // bare `-k v` sends evdev 1 (Escape in the standard keymap). Hyprland
     // reads virtual-keyboard keys through its configured layout to match
@@ -795,7 +886,9 @@ fn chord_keys(chord: Chord, with_shift: bool) -> Vec<String> {
     let mut keys: Vec<String> = (0..evdev - 1)
         .flat_map(|index| ["-p".to_owned(), format!("U{:04X}", 0x2460 + index)])
         .collect();
-    keys.extend(["-M".to_owned(), "ctrl".to_owned()]);
+    if control {
+        keys.extend(["-M".to_owned(), "ctrl".to_owned()]);
+    }
     if shift {
         keys.extend(["-M".to_owned(), "shift".to_owned()]);
     }
@@ -803,7 +896,9 @@ fn chord_keys(chord: Chord, with_shift: bool) -> Vec<String> {
     if shift {
         keys.extend(["-m".to_owned(), "shift".to_owned()]);
     }
-    keys.extend(["-m".to_owned(), "ctrl".to_owned()]);
+    if control {
+        keys.extend(["-m".to_owned(), "ctrl".to_owned()]);
+    }
     // GTK 3's reverse keymap lookup skips the final keycode. Keep the key
     // before a neutral VoidSymbol release so its shortcut remains discoverable
     // (#28).
@@ -920,6 +1015,19 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
         command
+    }
+
+    #[test]
+    fn a_file_is_one_percent_encoded_uri_list_line() {
+        assert_eq!(
+            file_uri(Path::new("/home/me/Scrawl 1/12.scrawl.slim.zip")).unwrap(),
+            "file:///home/me/Scrawl%201/12.scrawl.slim.zip\r\n"
+        );
+        assert_eq!(
+            file_uri(Path::new("/tmp/%s#?")).unwrap(),
+            "file:///tmp/%25s%23%3F\r\n"
+        );
+        assert!(file_uri(Path::new("relative/file")).is_err());
     }
 
     /// A typed-text job may start while a dictation paste still waits to
@@ -1082,6 +1190,18 @@ mod tests {
                     ["-M", "ctrl", "-k", key, "-m", "ctrl", "-p", "VoidSymbol"]
                 );
             }
+        }
+    }
+
+    /// Labs › YOLO mode: Return alone, on `KEY_ENTER`, with no
+    /// Ctrl and whatever the paste preference.
+    #[test]
+    fn return_sends_no_modifier() {
+        for with_shift in [false, true] {
+            assert_eq!(
+                chord_keys(Chord::Return, with_shift)[(EVDEV_KEY_ENTER - 1) * 2..],
+                ["-k", "Return", "-p", "VoidSymbol"]
+            );
         }
     }
 

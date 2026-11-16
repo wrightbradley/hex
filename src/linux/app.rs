@@ -23,7 +23,7 @@ use crate::desktop::activity::DesktopActivity;
 use crate::desktop::events::EventReader;
 use crate::desktop::host::{
     DesktopAction, DesktopListenerSnapshot, DesktopShortcut, DesktopSnapshot,
-    DesktopTranscriptionSnapshot,
+    DesktopTranscriptionSnapshot, ListenerStatus,
 };
 use crate::linux::dictation::ListenerUpdate;
 use crate::linux::input::{LinuxHotkey, ListenerCommand};
@@ -140,7 +140,7 @@ struct LinuxDesktopHost {
     activity: DesktopActivity,
     listener: Option<Listener>,
     listen_when_ready: bool,
-    status: String,
+    status: ListenerStatus,
     error: Option<String>,
     dismissed_failure_at: Option<u64>,
     /// What Hex's GNOME custom shortcuts were last written for (#781).
@@ -186,6 +186,7 @@ pub(crate) struct HostSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HostRequest {
     Desktop(DesktopAction),
+    ReloadSettings,
     /// Stops listening while the window records a shortcut.
     CaptureShortcutFor(ShortcutTarget),
     CancelShortcut,
@@ -258,6 +259,10 @@ impl HostHandle {
             let mut host = self.lock();
             match request {
                 HostRequest::Desktop(action) => host.dispatch(action),
+                HostRequest::ReloadSettings => {
+                    host.reload_changed_settings();
+                    Ok(())
+                }
                 HostRequest::CaptureShortcutFor(target) => {
                     host.begin_shortcut_edit(target, None);
                     Ok(())
@@ -284,12 +289,16 @@ impl HostHandle {
 
     /// Saves the window's settings, then adopts them. A failed save leaves
     /// the host's settings alone.
-    pub(crate) fn save_settings(&self, settings: AppSettings) -> Result<()> {
-        settings.save()?;
-        self.lock().adopt_settings(settings);
+    pub(crate) fn save_settings(
+        &self,
+        base: &AppSettings,
+        settings: &AppSettings,
+    ) -> Result<AppSettings> {
+        let settings = base.update(settings)?;
+        self.lock().adopt_settings(settings.clone());
         self.wake();
         self.notify();
-        Ok(())
+        Ok(settings)
     }
 
     /// The host's retained-history store; one store per process.
@@ -463,7 +472,8 @@ pub(crate) fn run(
         crate::updater::Updater::start(),
         processing,
     );
-    host.dictations = dictations.into();
+    let dictations = crate::dictation::service::DictationQueue::from(dictations);
+    host.dictations = dictations.clone();
     if enable_on_launch {
         host.start();
     }
@@ -475,6 +485,7 @@ pub(crate) fn run(
     crate::control::host::serve(
         control_receiver,
         Arc::new(control::LinuxControl {
+            dictations,
             host: host.clone(),
             published: Arc::downgrade(&published),
             window: control.clone(),
@@ -538,17 +549,19 @@ fn run_window(
     shutdown: &'static AtomicBool,
 ) {
     let app = host.clone();
-    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let failed = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::rune_ui::run_app(app, requests, first, shutdown)
     })) {
-        let reason = panic_reason(panic.as_ref());
-        tracing::error!(%reason, "the Hex window failed; Hex keeps running without it");
-        // `hex window show` and `hex status` say so instead of reporting
-        // a window that can no longer open (#979).
-        host.window_failed(reason);
-        while !shutdown.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(panic) => panic_reason(panic.as_ref()),
+    };
+    tracing::error!(%failed, "the Hex window failed; Hex keeps running without it");
+    // `hex window show` and `hex status` say so instead of reporting
+    // a window that can no longer open (#979).
+    host.window_failed(failed);
+    while !shutdown.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -630,7 +643,7 @@ impl LinuxDesktopHost {
             activity,
             listener: None,
             listen_when_ready: false,
-            status: "Disabled".into(),
+            status: ListenerStatus::Disabled,
             error: None,
             dismissed_failure_at: None,
             gnome_shortcuts: None,
@@ -701,9 +714,7 @@ impl LinuxDesktopHost {
                 self.settings_error = Some(issue.reload_error());
             }
             Ok((settings, None)) => {
-                // Adopting a fixed or removed file also clears this process's
-                // stale-defaults refusal; nowhere else does.
-                AppSettings::forget_unparseable(&path);
+                // Only the adopted snapshot gains permission to save.
                 if settings != self.settings {
                     tracing::info!("settings.json changed outside Hex; applying it");
                 }
@@ -717,9 +728,11 @@ impl LinuxDesktopHost {
         if cfg!(test) {
             return;
         }
-        let enabled =
-            crate::app_settings::transformations_used(&self.settings.dictation_processing)
-                || crate::personal_commands::workspace_configured();
+        let enabled = crate::personal_commands::host_needed(
+            crate::personal_commands::custom_transformations_selected(
+                &self.settings.dictation_processing,
+            ),
+        );
         match (enabled, self.personal_commands.is_some()) {
             (true, false) => {
                 self.personal_commands = crate::personal_commands::PersonalCommands::start(
@@ -742,13 +755,11 @@ impl LinuxDesktopHost {
         // Defaults are only an editable recovery projection after a failed load.
         // They must never become a recording configuration until saved successfully.
         if !self.settings_valid {
-            self.status = "Couldn't enable".into();
+            self.status = ListenerStatus::CouldNotEnable;
             return;
         }
-        let model = crate::transcription::models::definition(self.settings.transcription.model);
-        if !crate::transcription::models::is_installed(model, &self.settings.transcription.language)
-        {
-            self.status = "Model required".into();
+        if !crate::desktop::onboarding::model_ready(&self.settings.transcription) {
+            self.status = ListenerStatus::ModelRequired;
             return;
         }
         let stop = Arc::new(AtomicBool::new(false));
@@ -789,7 +800,7 @@ impl LinuxDesktopHost {
             commands,
             updates,
         });
-        self.status = "Enabling…".into();
+        self.status = ListenerStatus::Enabling;
     }
 
     /// Enable and Disable also decide whether Hex listens at its next launch,
@@ -851,7 +862,7 @@ impl LinuxDesktopHost {
         }
         if let Some(listener) = &self.listener {
             listener.stop();
-            self.status = "Disabling…".into();
+            self.status = ListenerStatus::Disabling;
         }
     }
 
@@ -929,9 +940,9 @@ impl LinuxDesktopHost {
             .take_if(|listener| listener.worker.is_finished())
         {
             match listener.finish() {
-                Ok(()) => self.status = "Disabled".into(),
+                Ok(()) => self.status = ListenerStatus::Disabled,
                 Err(error) => {
-                    self.status = "Couldn't enable".into();
+                    self.status = ListenerStatus::CouldNotEnable;
                     self.error = Some(error);
                 }
             }
@@ -951,7 +962,7 @@ impl LinuxDesktopHost {
             && self.listen_when_ready
             && let Some(status) = self.activity.state_label()
         {
-            self.status = status.into();
+            self.status = status;
         }
     }
 
@@ -1008,10 +1019,15 @@ impl LinuxDesktopHost {
     /// Adopts settings the window saved. A running listener applies them in
     /// place, so listening never stops for a settings change.
     fn adopt_settings(&mut self, settings: AppSettings) {
+        if settings.source.revision != 0 && settings.source.revision < self.settings.source.revision
+        {
+            return;
+        }
         // A valid file clears the parse error even when it loads the settings
         // already running (a fixed file equal to what Hex had in memory).
         self.settings_error = None;
         if self.settings_valid && settings == self.settings {
+            self.settings.source = settings.source;
             return;
         }
         if self
@@ -1325,9 +1341,9 @@ fn settings_modified() -> Option<std::time::SystemTime> {
 
 fn save_with(change: impl FnOnce(&mut AppSettings)) -> Result<AppSettings> {
     let mut settings = AppSettings::load()?;
+    let base = settings.clone();
     change(&mut settings);
-    settings.save()?;
-    Ok(settings)
+    base.update(&settings)
 }
 
 #[cfg(not(test))]
@@ -1369,7 +1385,7 @@ impl LinuxDesktopHost {
                 warming: self.listener.as_ref().is_some_and(|listener| {
                     matches!(listener.startup, ListenerStartup::Awaiting { .. })
                 }),
-                status: self.status.clone(),
+                status: self.status,
                 notice: crate::linux::paste::listener_warning(self.is_running()),
                 shortcuts: self
                     .listener
@@ -1628,7 +1644,7 @@ mod tests {
         assert!(host.settings_error.is_some());
         host.start();
         assert!(host.listen_when_ready);
-        assert_eq!(host.status, "Model required");
+        assert_eq!(host.status, ListenerStatus::ModelRequired);
         assert!(!host.is_running());
     }
 
@@ -1646,11 +1662,11 @@ mod tests {
         );
         host.start();
         assert!(!host.is_running());
-        assert_eq!(host.status, "Couldn't enable");
+        assert_eq!(host.status, ListenerStatus::CouldNotEnable);
         host.dispatch(DesktopAction::ClearError).unwrap();
         host.start();
         assert!(!host.is_running());
-        assert_eq!(host.status, "Couldn't enable");
+        assert_eq!(host.status, ListenerStatus::CouldNotEnable);
         assert!(!host.settings_valid);
 
         let mut recovered = host.settings.clone();
@@ -1659,7 +1675,7 @@ mod tests {
         assert!(host.settings_valid);
         assert_eq!(host.settings, recovered);
         assert!(!host.is_running());
-        assert_eq!(host.status, "Model required");
+        assert_eq!(host.status, ListenerStatus::ModelRequired);
     }
 
     #[test]
@@ -1724,9 +1740,9 @@ mod tests {
             assert_eq!(
                 host.status,
                 if expected.is_some() {
-                    "Couldn't enable"
+                    ListenerStatus::CouldNotEnable
                 } else {
-                    "Disabled"
+                    ListenerStatus::Disabled
                 }
             );
         }
@@ -1795,7 +1811,7 @@ mod tests {
             }
             Ok(())
         });
-        host.status = "Enabled".into();
+        host.status = ListenerStatus::Enabled;
         (host, received)
     }
 
@@ -1828,7 +1844,7 @@ mod tests {
         host.cancel_shortcut_edit();
         host.refresh_shortcut_edit();
         assert!(host.shortcut_edit.is_none());
-        assert_eq!(host.status, "Enabled");
+        assert_eq!(host.status, ListenerStatus::Enabled);
         let updates = received.try_iter().collect::<Vec<_>>();
         assert!(matches!(
             updates.as_slice(),
@@ -2010,7 +2026,7 @@ mod tests {
         host.dispatch(DesktopAction::StartListening).unwrap();
 
         assert!(host.listen_when_ready);
-        assert_eq!(host.status, "Disabled");
+        assert_eq!(host.status, ListenerStatus::Disabled);
         assert!(!host.is_running());
         assert!(host.listener.is_none());
         assert!(host.transcription_preparation.is_some());

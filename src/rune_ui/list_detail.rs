@@ -266,6 +266,17 @@ pub(super) fn meta_text(p: Paint, meta: &str) -> El {
         .truncate()
 }
 
+/// A meta line of its own under the card header, wrapping rather than
+/// truncating, for text too long to share the header's meta row.
+pub(super) fn meta_note(p: Paint, key: &str, note: &str) -> El {
+    text(note)
+        .key(key)
+        .font(DESCRIPTION)
+        .color(p.muted())
+        .wrap()
+        .mt(3.0)
+}
+
 /// The card's scrolling content under its header, clear of the scroll bar.
 pub(super) fn card_scroll(p: Paint, key: &str, content: El) -> El {
     card_scroll_sticky(p, key, content, false)
@@ -279,7 +290,7 @@ pub(super) fn card_scroll_sticky(p: Paint, key: &str, content: El, stick_bottom:
 
 /// The window's faded scroll body (`super::faded_body`); with
 /// `stick_bottom` it keeps its newest content in view while scrolled to the
-/// bottom (Labs › Follow live transcript).
+/// bottom (a recording meeting's transcript).
 pub(super) fn faded_body_sticky(
     k: &rune_kit::Kit,
     key: &str,

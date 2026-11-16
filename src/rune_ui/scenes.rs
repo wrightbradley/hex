@@ -46,7 +46,7 @@ pub(super) const SCENES: &[Scene] = &[
         *ui = portal_fixture();
         if let Some(view) = &mut ui.view {
             view.listener.running = false;
-            view.listener.status = "Disabled".into();
+            view.listener.status = crate::desktop::host::ListenerStatus::Disabled;
         }
     }),
     ("capturing", |ui| {
@@ -330,6 +330,31 @@ pub(super) const SCENES: &[Scene] = &[
     }),
     // macOS and Windows surfaces, from preview data (see `platform`).
     ("mac-settings", |ui| *ui = mac_fixture()),
+    // Paste last dictation changed from its default, then off: Reset brings
+    // the default back.
+    ("mac-settings-reset", |ui| {
+        *ui = mac_fixture();
+        let mut changed = HotkeyBinding::paste_last_default();
+        changed.modifiers.shift = None;
+        changed.modifiers.command = Some(ModifierSide::Either);
+        ui.settings.paste_last_hotkey = Some(changed);
+        ui.advanced.push(Pane::General);
+    }),
+    ("mac-settings-reset-off", |ui| {
+        *ui = mac_fixture();
+        ui.settings.paste_last_hotkey = None;
+        ui.advanced.push(Pane::General);
+    }),
+    // Recording Paste last dictation, which ⌫ turns off.
+    ("mac-settings-recording-optional", |ui| {
+        *ui = mac_fixture();
+        ui.advanced.push(Pane::General);
+        ui.capture = Capture::Listening {
+            target: ShortcutTarget::PasteLast,
+            message: None,
+            held: HotkeyModifiers::default(),
+        };
+    }),
     // The microphone row following a recorded voice (`--video`), and with
     // the microphone released while idle, when no audio arrives.
     ("mac-settings-mic-level", |ui| {
@@ -402,6 +427,7 @@ pub(super) const SCENES: &[Scene] = &[
     }),
     ("sound-sets-playing", |ui| {
         *ui = mac_fixture();
+        ui.settings.sound_effects = false;
         sound_sets::fixture(
             ui,
             Some((
@@ -729,6 +755,25 @@ pub(super) const SCENES: &[Scene] = &[
         ui.settings.labs.screenshots = true;
         ui.lab_store.group = Some(crate::labs::Feature::Screenshots.group());
     }),
+    // Labs › YOLO mode's card while on, limited to two apps.
+    ("mac-labs-yolo-mode", |ui| {
+        labs_with_some_on(ui);
+        ui.settings.labs.yolo_mode = true;
+        ui.settings.labs.yolo_mode_apps = vec!["Messages".into(), "Slack".into()];
+        crate::labs::apply(&ui.settings.labs);
+        ui.lab_store.group = Some(crate::labs::Feature::YoloMode.group());
+    }),
+    // The same card with its Only in picker open over the cards below.
+    ("mac-labs-yolo-mode-picker", |ui| {
+        labs_with_some_on(ui);
+        ui.settings.labs.yolo_mode = true;
+        ui.settings.labs.yolo_mode_apps = vec!["Slack".into()];
+        crate::labs::apply(&ui.settings.labs);
+        ui.lab_store.group = Some(crate::labs::Feature::YoloMode.group());
+        modes::fixture_catalog(ui);
+        ui.modes.picker_target = modes::PickerTarget::YoloMode;
+        ui.modes.application_picker_open = true;
+    }),
     // Labs on Windows and Linux: only their OS's labs, groups holding a
     // lab that's on open.
     ("windows-labs", |ui| {
@@ -808,6 +853,13 @@ pub(super) const SCENES: &[Scene] = &[
     }),
     ("mac-onboarding-ready", |ui| {
         mac_first_run(ui, onboarding::MacStep::Done, Page::Ready)
+    }),
+    // After the practice's "Use tap to start".
+    ("mac-onboarding-ready-tap", |ui| {
+        *ui = mac_fixture();
+        ui.settings.shortcut_mode = crate::dictation::ShortcutMode::Toggle;
+        onboarding::mac_fixture(ui, onboarding::MacStep::Done);
+        onboarding_kit::live::fixture(ui, Page::Ready);
     }),
 ];
 
@@ -931,7 +983,7 @@ pub(super) fn fixture(shortcuts: DesktopShortcuts) -> Ui {
         listener: DesktopListenerSnapshot {
             running: true,
             warming: false,
-            status: "Enabled".into(),
+            status: crate::desktop::host::ListenerStatus::Enabled,
             warning: None,
             notice: None,
             last_failure: None,

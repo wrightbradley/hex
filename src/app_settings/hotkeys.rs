@@ -375,6 +375,11 @@ pub(super) const MOUSE_INPUT_CODES: std::ops::Range<u16> = 0x8000..0x8020;
 /// `^`, `´`, or `` ` ``.
 pub const ISO_SECTION_KEY_CODE: u16 = 10;
 
+/// macOS's virtual key code for the microphone (dictation) key in a laptop
+/// keyboard's top row, in F5's position. Every press reports it with
+/// SecondaryFn set, and it types nothing.
+pub const MICROPHONE_KEY_CODE: u16 = 176;
+
 impl HotkeyKey {
     /// macOS mouse buttons occupy a separate input-code range, beyond every
     /// native keyboard code used by macOS. A shared trigger code lets keyboard
@@ -400,6 +405,16 @@ impl HotkeyKey {
 
     pub fn is_mouse(&self) -> bool {
         MOUSE_INPUT_CODES.contains(&self.code)
+    }
+
+    /// ⌫ (Backspace) or Delete: macOS's Delete and Forward Delete key codes,
+    /// elsewhere the named keys.
+    pub fn is_erase(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            matches!(self.code, 51 | 117)
+        } else {
+            matches!(self.name().as_str(), "backspace" | "delete")
+        }
     }
 
     /// A key identified by name on Windows and Linux.
@@ -943,6 +958,12 @@ impl HotkeyBinding {
             })
     }
 
+    /// ⌫ or Delete with no modifier: the recorder's gesture for turning a
+    /// shortcut off, never a shortcut itself.
+    pub fn is_bare_erase(&self) -> bool {
+        self.modifiers.is_empty() && self.key.as_ref().is_some_and(HotkeyKey::is_erase)
+    }
+
     /// What the input layers match. On macOS a letter key follows its
     /// letter: its keycap shows the letter, so it matches the key that types
     /// it on the layout published now, and keeps its recorded key when the
@@ -1100,13 +1121,14 @@ impl RuntimeHotkey {
 }
 
 /// macOS virtual key codes whose events always carry SecondaryFn: F1–F20,
-/// the arrows, Home, End, Page Up, Page Down, Forward Delete, and Help.
+/// the arrows, Home, End, Page Up, Page Down, Forward Delete, and Help, plus
+/// the microphone (dictation) key on laptop keyboards.
 pub(super) fn key_reports_function_flag(code: u16) -> bool {
     const CODES: [u16; 30] = [
         122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79, 80, 90,
         123, 124, 125, 126, 115, 119, 116, 121, 117, 114,
     ];
-    CODES.contains(&code)
+    CODES.contains(&code) || code == MICROPHONE_KEY_CODE
 }
 
 pub fn modifiers_from_flags(flags: u64) -> HotkeyModifiers {
@@ -1352,9 +1374,12 @@ pub struct RuntimeHotkeys {
 }
 
 impl RuntimeHotkeys {
+    /// The shortcuts [`Self::all`] lists by name, before the extra rows.
+    const NAMED: usize = 8;
+
     /// Every shortcut Hex matches, for suppression and chord evidence.
-    pub fn all(self) -> [Option<RuntimeHotkey>; 8 + MAX_EXTRA_DICTATION_SHORTCUTS] {
-        let named = [
+    pub fn all(self) -> [Option<RuntimeHotkey>; Self::NAMED + MAX_EXTRA_DICTATION_SHORTCUTS] {
+        let named: [_; Self::NAMED] = [
             Some(self.dictation),
             self.paste_last,
             self.paste_meeting,
@@ -1364,7 +1389,7 @@ impl RuntimeHotkeys {
             self.typed_text,
             self.second_dictation,
         ];
-        let mut all = [None; 8 + MAX_EXTRA_DICTATION_SHORTCUTS];
+        let mut all = [None; Self::NAMED + MAX_EXTRA_DICTATION_SHORTCUTS];
         all[..named.len()].copy_from_slice(&named);
         all[named.len()..].copy_from_slice(&self.extra_dictation);
         all

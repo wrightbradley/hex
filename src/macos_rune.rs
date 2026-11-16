@@ -49,7 +49,9 @@ use crate::desktop::host::{
 use crate::dictation::indicator::DictationIndicatorEvent;
 use crate::macos_rune::status_item::StatusItemAction;
 use crate::meeting::MeetingRequest;
-use crate::meeting::watcher::{ControllerEvent, ListenerConfig, MeetingMenuState};
+use crate::meeting::watcher::{
+    ControllerCommand, ControllerEvent, ListenerConfig, MeetingMenuState,
+};
 use crate::recognition::RecognitionControl;
 use crate::rune_hud::DictationIndicatorUi;
 use crate::rune_ui::{Destination, Ui};
@@ -222,12 +224,23 @@ pub(crate) fn quit() {
     }
 }
 
+/// Shows or hides the Dock icon, and marks the HUD's panel for a repair only
+/// when the activation policy actually changed: that can tie Rune's panel to
+/// one Space while AppKit still reports every Space (#1725), but a call that
+/// leaves the policy as it was changes nothing for the window server and must
+/// not reorder a shown HUD.
+pub(crate) fn set_dock_icon_visible(visible: bool) {
+    if crate::app_settings::set_dock_icon_visible(visible) {
+        crate::rune_hud::activation_policy_changed();
+    }
+}
+
 /// The window closed (hidden): the Dock follows the saved preference again.
 pub(crate) fn window_closed() {
     let show_dock_icon = AppSettings::load()
         .map(|settings| settings.show_dock_icon)
         .unwrap_or(false);
-    crate::app_settings::set_dock_icon_visible(crate::app_settings::dock_icon_visible(
+    set_dock_icon_visible(crate::app_settings::dock_icon_visible(
         show_dock_icon,
         crate::macos_rune::status_item::installed(),
     ));
@@ -478,6 +491,8 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
     } else {
         app.windowless()
     };
+    // The menu's Join reaches the same controller path as a reminder's.
+    let calendar_commands = controller_commands.clone();
     let capsules = {
         let window = window.clone();
         crate::rune_ui::meeting_capsules::MeetingCapsules::install(
@@ -486,13 +501,13 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
             {
                 let window = window.clone();
                 move |choice| {
-                    crate::app_settings::save_meeting_provider(choice.clone());
-                    window.update(move |ui, _| crate::rune_ui::meeting_provider_chosen(ui, choice));
+                    crate::app_settings::save_meeting_provider(choice);
+                    window.update(move |ui, _| crate::rune_ui::meeting_settings_saved(ui));
                 }
             },
             move |corner| {
                 crate::app_settings::save_meeting_indicator_corner(corner);
-                window.update(move |ui, _| crate::rune_ui::meeting_corner_moved(ui, corner));
+                window.update(move |ui, _| crate::rune_ui::meeting_settings_saved(ui));
             },
         )
     };
@@ -535,6 +550,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
         hud,
         status_actions: None,
         controller_events,
+        controller_commands: calendar_commands,
         developer_calls: developer_receiver,
         control_calls: pump_call_receiver,
         meeting_waiters: Vec::new(),
@@ -600,14 +616,23 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig, hidden: bool
             false
         });
     }
-    app.run();
+    // Rune r399 prints a startup error and exits the process from `run` on
+    // native targets, which would end Hex without stopping its workers or
+    // flushing the event log. The menu bar, HUD, and pump live in this loop,
+    // so take the error here and stop the way Quit does, with the reason in
+    // the process log and a failed launch's exit status. The Linux window
+    // keeps running instead (`rune_ui::run_app`).
+    let started = app.try_run();
+    if let Err(error) = &started {
+        tracing::error!(%error, "the Hex window failed; Hex stops");
+    }
 
     PUMP.with(|slot| {
         if let Some(state) = slot.borrow_mut().take() {
             state.timer.invalidate();
         }
     });
-    crate::desktop::process_exit::finish(&DRAIN)
+    crate::desktop::process_exit::finish_with(&DRAIN, if started.is_err() { 1 } else { 0 })
 }
 
 /// Stops and joins the runtime, listener, meeting controller, and local API.
@@ -627,6 +652,9 @@ struct Pump {
     hud: crate::rune_hud::HudSender,
     status_actions: Option<Receiver<StatusItemAction>>,
     controller_events: Receiver<ControllerEvent>,
+    /// The meeting controller's commands: the menu's Join takes the same
+    /// path as a reminder's.
+    controller_commands: SyncSender<ControllerCommand>,
     developer_calls: Receiver<crate::control::developer_control::DeveloperCall>,
     control_calls: Receiver<crate::control::ControlCall>,
     meeting_waiters: Vec<control::MeetingWaiter>,
@@ -705,7 +733,7 @@ fn start_main_thread() {
         }
     };
     // An open window always shows the Dock icon (see [`show`]).
-    crate::app_settings::set_dock_icon_visible(
+    set_dock_icon_visible(
         window_visible()
             || crate::app_settings::dock_icon_visible(
                 pump.show_dock_icon,
@@ -784,7 +812,7 @@ pub(crate) fn bring_window_forward() {
 fn bring_forward(window: &rune::AppHandle<Ui>) {
     // An open window always shows the Dock icon: hiding it
     // would deactivate Hex and drop the window behind other apps.
-    crate::app_settings::set_dock_icon_visible(true);
+    set_dock_icon_visible(true);
     if let Some(mtm) = MainThreadMarker::new() {
         let app = NSApplication::sharedApplication(mtm);
         app.activate();
@@ -816,6 +844,9 @@ impl Pump {
         while let Ok(event) = self.indicator_events.try_recv() {
             indicator.handle(event);
         }
+        // A Dock icon change repairs the panel once even where AppKit still
+        // reports the active Space, before the usual per-tick check.
+        indicator.reassert_after_activation_policy_change();
         indicator.follow_pointer();
         while let Ok(call) = self.developer_calls.try_recv() {
             let reply = self.developer(call.command, indicator);
@@ -860,6 +891,7 @@ impl Pump {
                 &self.meeting_state,
                 crate::app_settings::meetings_enabled(),
             );
+            crate::macos_rune::status_item::update_calendar_menu();
             crate::macos_rune::status_item::update_software(&update_status());
             crate::macos_rune::status_item::update_pause();
             self.meeting_menu_at = now + MEETING_MENU_REFRESH;
@@ -887,6 +919,25 @@ impl Pump {
                     .runtime
                     .recognition(RecognitionControl::PasteLast { reply: None });
             }
+            // Labs › Copy dictation audio: the newest kept recording as a
+            // file on the clipboard, never pasted.
+            StatusItemAction::CopyLastDictationAudio => {
+                if !(crate::labs::copy_dictation_audio() && crate::labs::keep_recordings()) {
+                    return;
+                }
+                let copied = self
+                    .runtime
+                    .history()
+                    .and_then(|history| history.newest_recording(crate::history::now_ms()))
+                    .ok_or_else(|| eyre!("no dictation with kept audio is in History"))
+                    .and_then(|path| {
+                        crate::history::recordings::copy_to_clipboard(&path)
+                            .map_err(|error| eyre!("{error:#}"))
+                    });
+                if let Err(error) = copied {
+                    tracing::warn!(%error, "could not copy the last dictation's audio");
+                }
+            }
             // Labs › Copy recent dictations: copied, never pasted.
             StatusItemAction::CopyRecentDictation(id) => {
                 if !crate::labs::recent_dictations() {
@@ -903,6 +954,21 @@ impl Pump {
                     });
                 if let Err(error) = copied {
                     tracing::warn!(%error, "could not copy a recent dictation");
+                }
+            }
+            // Labs › Upcoming meetings in menu bar: opens the link without
+            // recording, records the occurrence so its reminder never pops,
+            // and closes that reminder's capsule if it is up.
+            StatusItemAction::JoinCalendarMeeting(meeting) => {
+                if !crate::labs::calendar_menu() {
+                    return;
+                }
+                if self
+                    .controller_commands
+                    .try_send(ControllerCommand::JoinFromMenu(meeting))
+                    .is_err()
+                {
+                    tracing::warn!("could not reach the meeting controller to join a meeting");
                 }
             }
             StatusItemAction::Update => {
@@ -974,7 +1040,8 @@ impl Pump {
         match event {
             ControllerEvent::Offer(_)
             | ControllerEvent::Reminder { .. }
-            | ControllerEvent::ReminderWithdrawn { .. } => {}
+            | ControllerEvent::ReminderWithdrawn { .. }
+            | ControllerEvent::CallEndedWithdrawn => {}
             ControllerEvent::Starting => self.meeting_state = MeetingMenuState::Starting,
             ControllerEvent::RecordingStarted { id, title, .. } => {
                 self.meeting_state = MeetingMenuState::Recording {
@@ -1000,9 +1067,6 @@ impl Pump {
                 if let MeetingMenuState::Recording { title: shown, .. } = &mut self.meeting_state {
                     *shown = title;
                 }
-            }
-            ControllerEvent::OpenMeeting(id) => {
-                show(&self.window, Destination::Meetings(Some(id)));
             }
             ControllerEvent::CallEnded { app, auto_stop } => {
                 if auto_stop {

@@ -265,6 +265,8 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
     let quit = window.clone();
     let runtime_tray = tray.clone();
     let runtime_shared = shared.clone();
+    let dictations = crate::dictation::service::DictationQueue::from(dictations);
+    let listener_queries = dictations.clone();
     let runtime = std::thread::Builder::new()
         .name("hex-runtime".into())
         .spawn(move || {
@@ -278,7 +280,7 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
                 shutdown,
                 hud,
                 runtime_tray.as_deref(),
-                dictations.into(),
+                dictations,
                 processing,
             );
             quit.quit();
@@ -286,6 +288,7 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
     crate::control::host::serve(
         control_receiver,
         Arc::new(WindowsControl {
+            dictations: listener_queries,
             runtime: runtime_handle(),
             shared,
             window: Mutex::new(window.clone()),
@@ -296,9 +299,17 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
         relaunch.open();
         true
     });
-    // Returns on Quit, or when the window closes without a tray.
-    app.run();
-    crate::windows::gpu_fallback::disarm();
+    // Returns on Quit, or when the window closes without a tray. Rune r399
+    // prints a startup error and exits the process from `run` on native
+    // targets, which would skip the stop below; take the error, stop
+    // everything, then report it.
+    let result = app.try_run();
+    if result.is_ok() {
+        // A frame reached the screen, or Hex quit cleanly: this launch's GPU
+        // works. A failed start is neither, and keeps the marker so the next
+        // launch draws on the high-performance GPU.
+        crate::windows::gpu_fallback::disarm();
+    }
     shutdown.store(true, Ordering::Relaxed);
     drop(requests);
     let _ = runtime.join();
@@ -308,7 +319,10 @@ pub fn open(event_path: PathBuf, shutdown: &'static AtomicBool, start_hidden: bo
     }
     drop(local_api);
     drop(tray);
-    Ok(())
+    if let Err(error) = &result {
+        tracing::error!(%error, "the Hex window failed");
+    }
+    result.map_err(|error| eyre!("the Hex window failed: {error}"))
 }
 
 /// Hex is ending: Rune runs this before the loop ends, including from Windows'
@@ -351,6 +365,7 @@ fn run_runtime(
 ) {
     let mut tray_view = None;
     let mut tray_meetings = None;
+    let mut tray_dictation_audio = None;
     indicator.set_position(settings.indicator_position);
     let mut host = WindowsDesktopHost::new(
         event_path,
@@ -380,7 +395,10 @@ fn run_runtime(
         let published = Arc::new(host.publish());
         let changed = {
             let mut current = lock(&shared.published);
-            let changed = current.as_deref() != Some(&published);
+            let changed = current.as_deref() != Some(&published)
+                || current.as_ref().is_some_and(|old| {
+                    old.settings.source.revision != published.settings.source.revision
+                });
             if changed {
                 *current = Some(published.clone());
             }
@@ -393,11 +411,29 @@ fn run_runtime(
             }
         }
         let meetings = crate::meeting::runtime::tray_state();
+        // Labs › Copy dictation audio: listed while the lab is on, and
+        // enabled while a kept recording can be copied. The gate comes
+        // first, and this only reads History with a tray, so an off lab
+        // costs one atomic read; it joins the rebuild condition so a copy
+        // that appears or expires redraws the menu without a publish.
+        let dictation_audio = if tray.is_some() && crate::labs::copy_dictation_audio() {
+            Some(
+                host.history()
+                    .and_then(|history| history.newest_recording(crate::history::now_ms()))
+                    .is_some(),
+            )
+        } else {
+            None
+        };
         if let Some(tray) = tray
-            && (changed || tray_view.is_none() || tray_meetings != meetings)
+            && (changed
+                || tray_view.is_none()
+                || tray_meetings != meetings
+                || tray_dictation_audio != dictation_audio)
         {
             tray_meetings = meetings;
-            let view = tray_view_for(&published);
+            tray_dictation_audio = dictation_audio;
+            let view = tray_view_for(&published, dictation_audio);
             if tray_view.as_ref() != Some(&view) {
                 tray.set_tooltip(view.tooltip());
                 tray.set_menu(view.menu());
@@ -418,6 +454,7 @@ fn runtime_handle() -> RuntimeHandle {
 /// The Windows adapter `hex` control commands from the local API run
 /// through ([`crate::control::host`]).
 struct WindowsControl {
+    dictations: crate::dictation::service::DictationQueue,
     runtime: RuntimeHandle,
     shared: Arc<Shared>,
     window: Mutex<rune::AppHandle<Ui>>,
@@ -466,9 +503,16 @@ impl crate::control::host::Host for WindowsControl {
             listener: published.listener.clone(),
             transcription: published.transcription.clone(),
             update: published.update_status.clone(),
-            capture: crate::control::host::capture_from_state(published.activity),
             window_open: self.window().is_visible(),
         })
+    }
+
+    fn capture(&self) -> std::result::Result<crate::control::CaptureSnapshot, ControlError> {
+        if self.state()?.listener.running {
+            self.dictations.snapshot(crate::windows::dictation::wake)
+        } else {
+            Ok(Default::default())
+        }
     }
 
     fn dictation(
@@ -488,9 +532,12 @@ impl crate::control::host::Host for WindowsControl {
         self.listener(crate::windows::dictation::ListenerCommand::PasteLast)
     }
 
-    fn save(&self, settings: AppSettings) -> std::result::Result<(), ControlError> {
-        settings
-            .save()
+    fn save(
+        &self,
+        base: &AppSettings,
+        settings: AppSettings,
+    ) -> std::result::Result<(), ControlError> {
+        base.update(&settings)
             .map_err(|error| ControlError::new("internal", format!("couldn't save: {error:#}")))?;
         self.send(Request::ReloadSettings)
     }
@@ -614,9 +661,10 @@ impl crate::control::host::Host for WindowsControl {
 // The tray and the window icon
 
 /// What the tray shows for what the runtime published.
-fn tray_view_for(published: &Published) -> TrayView {
+fn tray_view_for(published: &Published, dictation_audio: Option<bool>) -> TrayView {
     TrayView {
         meetings: crate::meeting::runtime::tray_state(),
+        dictation_audio,
         ..TrayView::new(
             published.listener.running,
             published.state,
@@ -880,6 +928,22 @@ fn create_tray(window: rune::AppHandle<Ui>) -> Result<rune::Tray> {
                     tracing::warn!(%error, ?command, "the tray action failed");
                 }
             }
+            Some(TrayCommand::CopyLastDictationAudio) => {
+                if !(crate::labs::copy_dictation_audio() && crate::labs::keep_recordings()) {
+                    return;
+                }
+                let copied = runtime()
+                    .and_then(|runtime| runtime.history())
+                    .and_then(|history| history.newest_recording(crate::history::now_ms()))
+                    .ok_or_else(|| eyre!("no dictation with kept audio is in History"))
+                    .and_then(|path| {
+                        crate::history::recordings::copy_to_clipboard(&path)
+                            .map_err(|error| eyre!("{error:#}"))
+                    });
+                if let Err(error) = copied {
+                    tracing::warn!(%error, "could not copy the last dictation's audio");
+                }
+            }
             Some(command) => {
                 let Some(runtime) = runtime() else { return };
                 let published = runtime.published();
@@ -905,7 +969,8 @@ fn create_tray(window: rune::AppHandle<Ui>) -> Result<rune::Tray> {
                     | TrayCommand::Quit
                     | TrayCommand::RecordMeeting
                     | TrayCommand::StopMeeting
-                    | TrayCommand::CopyLastMeeting => return,
+                    | TrayCommand::CopyLastMeeting
+                    | TrayCommand::CopyLastDictationAudio => return,
                 };
                 let _ = runtime.send(request);
             }

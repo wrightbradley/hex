@@ -32,14 +32,14 @@ const MODEL_FIELD_WIDTH: f32 = 240.0;
 pub(super) enum Target {
     Mode(Selection),
     /// `meetings.opencode_model` (Meetings › Settings › Summaries): no
-    /// thinking variant, and its default entry clears it, so Hex picks one
-    /// of its fast models.
+    /// thinking variant, and its default entry clears it, so OpenCode's own
+    /// default model writes them.
     MeetingSummary,
 }
 
 /// The meeting summary picker's default entry, and the field while it is
 /// chosen.
-pub(super) const SUMMARY_AUTOMATIC: &str = "Hex picks a fast model";
+pub(super) const SUMMARY_AUTOMATIC: &str = "OpenCode's default model";
 
 pub(super) struct Models {
     state: ModelCatalogState,
@@ -202,7 +202,10 @@ impl Models {
 fn selected(settings: &AppSettings, target: Target) -> (Option<&str>, Option<&str>) {
     match target {
         Target::Mode(selection) => {
-            let processing = &super::modes::mode(settings, selection).post_processing;
+            let Some(mode) = super::modes::mode(settings, selection) else {
+                return (None, None);
+            };
+            let processing = &mode.post_processing;
             (processing.model.as_deref(), processing.variant.as_deref())
         }
         Target::MeetingSummary => (
@@ -224,7 +227,10 @@ fn set_model(
 ) {
     match target {
         Target::Mode(selection) => {
-            let processing = &mut super::modes::mode_mut(settings, selection).post_processing;
+            let Some(mode) = super::modes::mode_mut(settings, selection) else {
+                return;
+            };
+            let processing = &mut mode.post_processing;
             processing.model = model;
             processing.variant = variant;
         }

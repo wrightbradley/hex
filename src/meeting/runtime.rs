@@ -60,12 +60,12 @@ impl Meetings {
                 app,
                 commands,
                 move |choice| {
-                    crate::app_settings::save_meeting_provider(choice.clone());
-                    chosen.update(move |ui, _| crate::rune_ui::meeting_provider_chosen(ui, choice));
+                    crate::app_settings::save_meeting_provider(choice);
+                    chosen.update(move |ui, _| crate::rune_ui::meeting_settings_saved(ui));
                 },
                 move |corner| {
                     crate::app_settings::save_meeting_indicator_corner(corner);
-                    moved.update(move |ui, _| crate::rune_ui::meeting_corner_moved(ui, corner));
+                    moved.update(move |ui, _| crate::rune_ui::meeting_settings_saved(ui));
                 },
             )
         };
@@ -192,13 +192,6 @@ fn follow(event: &ControllerEvent, window: &rune::AppHandle<Ui>) {
             tracing::info!(id = %manifest.id, "meeting transcript ready");
             *state = MeetingMenuState::Idle;
         }
-        ControllerEvent::OpenMeeting(id) => {
-            let id = id.clone();
-            window.update(move |ui, tx| {
-                crate::rune_ui::show(ui, Destination::Meetings(Some(id)), tx)
-            });
-            window.open();
-        }
         ControllerEvent::Failed { title, error } => {
             tracing::error!(%title, %error, "meeting failed");
             *state = MeetingMenuState::Idle;
@@ -224,6 +217,7 @@ fn follow(event: &ControllerEvent, window: &rune::AppHandle<Ui>) {
         ControllerEvent::Offer(_)
         | ControllerEvent::Reminder { .. }
         | ControllerEvent::ReminderWithdrawn { .. }
+        | ControllerEvent::CallEndedWithdrawn
         | ControllerEvent::NotesStarted
         | ControllerEvent::NotesFinished(_) => {}
     }

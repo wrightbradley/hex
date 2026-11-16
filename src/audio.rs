@@ -10,6 +10,7 @@ pub(crate) mod input_level;
 pub(crate) mod instant;
 #[cfg(target_os = "macos")]
 mod lid;
+pub(crate) mod linger;
 #[cfg(any(target_os = "windows", test))]
 mod mix_format;
 pub(crate) mod output_ducking;
@@ -296,6 +297,9 @@ struct OpenRequest {
     avoids_bluetooth: bool,
     /// The UID of the input a meeting's call app records from, tried first.
     call_input: Option<String>,
+    /// Whether the open makes the device renegotiate its sample rate first: a
+    /// silence recovery's device can stay on a stale clock (#1575).
+    renegotiate_rate: bool,
 }
 
 impl OpenRequest {
@@ -424,6 +428,7 @@ impl AudioInput {
             keep: None,
             avoids_bluetooth: true,
             call_input: None,
+            renegotiate_rate: false,
         })? {
             Opened::Input(input) => Ok(*input),
             Opened::Unchanged { .. } => unreachable!("nothing to keep"),
@@ -439,13 +444,19 @@ impl AudioInput {
             .iter()
             .position(|name| name.to_lowercase().contains(&query_lower))
             .ok_or_else(|| eyre!("microphone is unavailable: {query}"))?;
-        Self::open_device(devices[index].clone(), names[index].clone(), false)
+        Self::open_device(devices[index].clone(), names[index].clone(), false, false)
     }
 
     /// Opens `device`. `follows_default` marks cpal's default-input handle,
     /// whose Windows stream reports a default change as invalidation while
-    /// it keeps running on the old device.
-    fn open_device(device: Device, device_name: String, follows_default: bool) -> Result<Self> {
+    /// it keeps running on the old device. `renegotiate_rate` makes the
+    /// device change its sample rate before the stream opens (#1575).
+    fn open_device(
+        device: Device,
+        device_name: String,
+        follows_default: bool,
+        renegotiate_rate: bool,
+    ) -> Result<Self> {
         #[cfg(target_os = "macos")]
         watch_input_devices();
         let uid = device.id().ok().map(|id| id.id().to_owned());
@@ -457,6 +468,7 @@ impl AudioInput {
             &device,
             &device_name,
             follows_default.then(|| device_name.clone()),
+            renegotiate_rate,
         )?;
 
         Ok(Self {
@@ -587,6 +599,7 @@ impl RecoveringAudioInput {
             keep: None,
             avoids_bluetooth: true,
             call_input: None,
+            renegotiate_rate: false,
         })
         .and_then(|opened| match opened {
             Opened::Input(input) => Ok(*input),
@@ -603,8 +616,9 @@ impl RecoveringAudioInput {
                 self.after_resolving(now);
             }
             Err(error) => {
+                let error = format!("{error:#}");
                 tracing::warn!(%error, "could not open dictation microphone at startup; retrying");
-                self.outage.get_or_insert(Some(error.to_string()));
+                self.outage.get_or_insert(Some(error));
                 self.recovery.request_stream_recovery(now);
                 self.recovery.failed(now);
             }
@@ -682,6 +696,13 @@ impl RecoveringAudioInput {
 
     pub fn request_recovery(&mut self) {
         self.recovery.request_stream_recovery(Instant::now());
+    }
+
+    /// A finished dictation was digital silence (#1122): reopen the stream and
+    /// make that open renegotiate the device's sample rate first, which clears
+    /// a device left on a stale clock (#1575).
+    pub fn request_silence_recovery(&mut self) {
+        self.recovery.request_silence_recovery(Instant::now());
     }
 
     pub fn is_recovering(&self) -> bool {
@@ -954,12 +975,13 @@ impl RecoveringAudioInput {
             keep,
             avoids_bluetooth: true,
             call_input: None,
+            renegotiate_rate: self.recovery.take_renegotiation(),
         };
         self.route_generation = (self.route_generation_source)();
         let opener = self.opener.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let result = opener(&request).map_err(|error| error.to_string());
+            let result = opener(&request).map_err(|error| format!("{error:#}"));
             let _ = sender.send((revision, result));
         });
         self.replacement = Some(receiver);
@@ -1249,7 +1271,8 @@ fn open_configured_input(request: &OpenRequest) -> Result<Opened> {
                 "the saved microphone is off while the lid is closed; using the system default"
             ),
         }
-        let mut input = AudioInput::open_device(device, name, follows_default)?;
+        let mut input =
+            AudioInput::open_device(device, name, follows_default, request.renegotiate_rate)?;
         input.selection = plan.selection;
         // The ALSA default cannot name another PipeWire source, so Linux
         // moves the opened stream off a Bluetooth default instead.
@@ -1296,10 +1319,12 @@ fn open_configured_input(request: &OpenRequest) -> Result<Opened> {
 /// from (`call_input`, a device UID) when that opens, else one resolved like
 /// dictation's but keeping a Bluetooth default a call app on a headset uses;
 /// or keeps the open one named `keep` when it resolves to that again.
+/// `renegotiate_rate` marks a silence recovery's open, like dictation's.
 pub fn open_meeting_input(
     selected_device: Option<&str>,
     call_input: Option<&str>,
     keep: Option<&str>,
+    renegotiate_rate: bool,
 ) -> Result<Opened> {
     open_configured_input(&OpenRequest {
         device_override: None,
@@ -1308,6 +1333,7 @@ pub fn open_meeting_input(
         keep: keep.map(str::to_owned),
         avoids_bluetooth: false,
         call_input: call_input.map(str::to_owned),
+        renegotiate_rate,
     })
 }
 
@@ -1329,12 +1355,14 @@ fn open_selected<T>(
             Ok(input) => return Ok(input),
             Err(error) if attempt >= attempts => break error,
             Err(error) => {
+                let error = format!("{error:#}");
                 tracing::debug!(%error, device, attempt, "could not open the selected microphone; retrying");
                 attempt += 1;
                 sleep(SELECTED_MICROPHONE_RETRY_DELAY);
             }
         }
     };
+    let error = format!("{error:#}");
     tracing::debug!(%error, device, "the saved microphone would not open");
     open_default()
 }
@@ -1692,6 +1720,7 @@ mod tests {
             keep: None,
             avoids_bluetooth,
             call_input: None,
+            renegotiate_rate: false,
         };
         let target = |request: OpenRequest| {
             resolve_input(
@@ -2729,6 +2758,45 @@ mod tests {
         ));
         assert_eq!(*seen.lock().unwrap(), Some(true));
         assert!(!old_switch.is_on());
+    }
+
+    /// A route generation only the silence test changes, so another test's
+    /// route change cannot reopen its microphone.
+    static SILENCE_ROUTE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    fn silence_route_generation() -> u64 {
+        SILENCE_ROUTE_GENERATION.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn a_silent_stream_reopens_with_a_rate_renegotiation() {
+        let renegotiations = Arc::new(Mutex::new(Vec::new()));
+        let seen = renegotiations.clone();
+        let mut input = RecoveringAudioInput::with_opener_for_test(
+            None,
+            silence_route_generation,
+            move |request| {
+                seen.lock().unwrap().push(request.renegotiate_rate);
+                Ok(Opened::Input(Box::new(named_input("Test microphone"))))
+            },
+        );
+        input.finish_initial_open(Ok(named_input("Test microphone")), Instant::now());
+
+        // A dictation of digital silence reopens the microphone, and that open
+        // renegotiates the device's sample rate first (#1575).
+        input.request_silence_recovery();
+        assert!(matches!(
+            settle(&mut input, true),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        // A stream failure reopens the same microphone without it.
+        input.request_recovery();
+        assert!(matches!(
+            settle(&mut input, true),
+            RecoveringAudioInputEvent::Reopened
+        ));
+        // Only the silence open renegotiated; the next open took nothing.
+        assert_eq!(*renegotiations.lock().unwrap(), vec![true, false]);
     }
 
     /// A route generation only the stall tests change, so another test's
